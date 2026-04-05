@@ -1364,6 +1364,100 @@ class C3k2RepLK(C2f):
         )
 
 
+class UIBottleneck(nn.Module):
+    """Universal Inverted Bottleneck with Large Kernel and Layer Scale.
+
+    Minimal safe adaptation of RepLKUIB ideas for C3k2:
+        DW 7×7 (spatial) → PW 1×1 expand (GELU) → PW 1×1 project (linear) → γ·out + residual
+
+    Compared to standard Bottleneck (Conv 3×3 → Conv 3×3, e=1.0):
+        - UIB structure (DW before PW) from MobileNetV4
+        - Large kernel 7×7 for receptive field (single conv, standard BN fuse)
+        - GELU activation from ConvNeXt/MobileNetV5
+        - Layer Scale (γ init 1e-5) from MobileNetV5 for training stability
+
+    At inference, γ is absorbed into the last conv weights (zero overhead).
+    """
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 4.0):
+        """Initialize UIBottleneck module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            e (float): Expansion ratio for the pointwise layers.
+        """
+        super().__init__()
+        c_ = int(c2 * e)
+        self.dw = Conv(c1, c1, 7, 1, 3, g=c1, act=False)
+        self.pw = nn.Sequential(
+            Conv(c1, c_, 1, 1, act=nn.GELU(approximate="tanh")),
+            Conv(c_, c2, 1, 1, act=False),
+        )
+        self.add = shortcut and c1 == c2
+        self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass with layer scale and residual."""
+        out = self.pw(self.dw(x))
+        if self.add:
+            return x + out * self.gamma.view(1, -1, 1, 1)
+        return out
+
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass after layer scale is fused into conv weights."""
+        out = self.pw(self.dw(x))
+        return x + out if self.add else out
+
+    def fuse_layer_scale(self):
+        """Absorb layer scale gamma into the last convolution weights (zero-cost at inference)."""
+        if self.gamma is None:
+            return
+        gamma = self.gamma.data
+        last_conv = self.pw[-1]
+        if hasattr(last_conv, "bn"):
+            last_conv.conv = fuse_conv_and_bn(last_conv.conv, last_conv.bn)
+            delattr(last_conv, "bn")
+            last_conv.forward = last_conv.forward_fuse
+        last_conv.conv.weight.data *= gamma.view(-1, 1, 1, 1)
+        if last_conv.conv.bias is not None:
+            last_conv.conv.bias.data *= gamma
+        delattr(self, "gamma")
+        self.gamma = None
+        self.forward = self.forward_fuse
+
+
+class C3k2UIB(C2f):
+    """CSP Bottleneck with 2 convolutions using UIBottleneck blocks.
+
+    Drop-in replacement for C3k2 with large-kernel UIB blocks and layer scale.
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 4.0):
+        """Initialize C3k2UIB module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of UIBottleneck blocks.
+            e (float): Expansion ratio for C2f split channels.
+            attn (bool): Whether to use attention blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            uib_e (float): Expansion ratio for UIBottleneck pointwise layers.
+        """
+        super().__init__(c1, c2, n, shortcut, e=e)
+        self.m = nn.ModuleList(
+            nn.Sequential(
+                UIBottleneck(self.c, self.c, shortcut, e=uib_e),
+                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+            )
+            if attn
+            else UIBottleneck(self.c, self.c, shortcut, e=uib_e)
+            for _ in range(n)
+        )
+
+
 class RepVGGDW(torch.nn.Module):
     """RepVGGDW is a class that represents a depth-wise convolutional block in RepVGG architecture."""
 

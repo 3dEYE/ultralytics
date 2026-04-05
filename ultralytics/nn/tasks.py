@@ -38,6 +38,7 @@ from ultralytics.nn.modules import (
     C3Ghost,
     C3k2,
     C3k2RepLK,
+    C3k2UIB,
     C3x,
     CBFuse,
     CBLinear,
@@ -63,6 +64,7 @@ from ultralytics.nn.modules import (
     RepConv,
     RepDWConv,
     RepLKUIB,
+    UIBottleneck,
     RepNCSPELAN4,
     RepVGGDW,
     ResNetLayer,
@@ -257,6 +259,8 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, RepLKUIB):
                     m.fuse_layer_scale()
                     m.forward = m.forward_fuse
+                if isinstance(m, UIBottleneck):
+                    m.fuse_layer_scale()
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
             self.info(verbose=verbose)
@@ -1602,6 +1606,7 @@ def parse_model(d, ch, verbose=True):
             C2f,
             C3k2,
             C3k2RepLK,
+            C3k2UIB,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1629,6 +1634,7 @@ def parse_model(d, ch, verbose=True):
             C2f,
             C3k2,
             C3k2RepLK,
+            C3k2UIB,
             C2fAttn,
             C3,
             C3TR,

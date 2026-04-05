@@ -1,12 +1,14 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-# YOLO11-RepLK v3 — Large-kernel UIB with ConvNeXt-level 4× FFN expansion
+# YOLO15-RepLK v3 — Large-kernel UIB with ConvNeXt-level 4× FFN expansion
 # Architecture: DW 7×7 (reparameterized) → PW expand(4×) → PW project
 # Stem: Conv+Conv (width-scaled, YOLO26-style)
 # Quality > YOLO26 at −12-13% GFLOPs (s/m/l scales)
 # xl/2xl: large-capacity variants (uncapped channels) targeting RF-DETR-class quality
 
-nc: 6
-reg_max: 1
+# Parameters
+nc: 80 # number of classes
+end2end: False # whether to use end-to-end mode
+reg_max: 1 # DFL bins
 scales:
   n: [0.50, 0.25, 1024]
   s: [0.50, 0.50, 1024]

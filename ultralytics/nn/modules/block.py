@@ -487,6 +487,27 @@ class Bottleneck(nn.Module):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
+class DropPath(nn.Module):
+    """Stochastic depth regularization (drop entire residual branch per sample).
+
+    During training, randomly drops the path with probability `drop_prob`.
+    During inference, acts as identity (zero overhead).
+    """
+
+    def __init__(self, drop_prob: float = 0.0):
+        """Initialize DropPath with given drop probability."""
+        super().__init__()
+        self.drop_prob = drop_prob
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply stochastic depth: randomly zero out entire samples in a batch."""
+        if self.drop_prob == 0.0 or not self.training:
+            return x
+        keep = 1 - self.drop_prob
+        mask = x.new_empty(x.shape[0], *((1,) * (x.ndim - 1))).bernoulli_(keep).div_(keep)
+        return x * mask
+
+
 class RepDWConv(nn.Module):
     """Reparameterizable multi-branch depthwise convolution with identity.
 
@@ -564,7 +585,7 @@ class RepLKUIB(nn.Module):
         Infer:  DW 7x7 (fused)                 -> Conv 1x1 (expand)       -> Conv 1x1 (project, γ absorbed) -> out + x
     """
 
-    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 1.0):
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 1.0, drop_path: float = 0.0):
         """Initialize RepLKUIB module.
 
         Args:
@@ -572,6 +593,7 @@ class RepLKUIB(nn.Module):
             c2 (int): Output channels.
             shortcut (bool): Whether to use shortcut connection.
             e (float): Expansion ratio for the hidden (expanded) channels.
+            drop_path (float): Stochastic depth rate (0 = disabled).
         """
         super().__init__()
         c_ = max(int(c2 * e), c1)  # expanded channels (at least c1 for channel mixing)
@@ -582,12 +604,13 @@ class RepLKUIB(nn.Module):
         self.add = shortcut and c1 == c2
         # Layer Scale (MobileNetV5): small init stabilizes large-kernel residual branches
         self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
+        self.drop_path = DropPath(drop_path) if drop_path > 0.0 and self.add else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through RepLKUIB block with layer scale."""
+        """Forward pass through RepLKUIB block with layer scale and optional stochastic depth."""
         out = self.pw(self.dw(x))
         if self.add:
-            return x + out * self.gamma.view(1, -1, 1, 1)
+            return x + self.drop_path(out * self.gamma.view(1, -1, 1, 1))
         return out
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
@@ -1315,7 +1338,7 @@ class C3k(C3):
 class C3k2RepLK(C2f):
     """CSP Bottleneck with 2 convolutions using RepLKUIB blocks for efficient large-kernel feature extraction."""
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 1.0):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 1.0, drop_path: float = 0.0):
         """Initialize C3k2RepLK module.
 
         Args:
@@ -1326,16 +1349,18 @@ class C3k2RepLK(C2f):
             attn (bool): Whether to use attention blocks.
             shortcut (bool): Whether to use shortcut connections.
             uib_e (float): Expansion ratio for RepLKUIB pointwise layers.
+            drop_path (float): Max stochastic depth rate (linearly increases across blocks).
         """
         super().__init__(c1, c2, n, shortcut, e=e)
+        dp_rates = [drop_path * (i + 1) / n for i in range(n)]  # linearly increasing 0→drop_path
         self.m = nn.ModuleList(
             nn.Sequential(
-                RepLKUIB(self.c, self.c, shortcut, e=uib_e),
+                RepLKUIB(self.c, self.c, shortcut, e=uib_e, drop_path=dp_rates[i]),
                 PSABlockMQ(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else RepLKUIB(self.c, self.c, shortcut, e=uib_e)
-            for _ in range(n)
+            else RepLKUIB(self.c, self.c, shortcut, e=uib_e, drop_path=dp_rates[i])
+            for i in range(n)
         )
 
 

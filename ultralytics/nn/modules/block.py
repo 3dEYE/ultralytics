@@ -37,6 +37,8 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C2PSAMQ",
+    "C3k2RepLK",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -47,6 +49,10 @@ __all__ = (
     "ImagePoolingAttn",
     "Proto",
     "RepC3",
+    "MQAttention",
+    "PSABlockMQ",
+    "RepDWConv",
+    "RepLKUIB",
     "RepNCSPELAN4",
     "RepVGGDW",
     "ResNetLayer",
@@ -479,6 +485,185 @@ class Bottleneck(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Apply bottleneck with optional shortcut connection."""
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
+
+
+class RepDWConv(nn.Module):
+    """Reparameterizable multi-branch depthwise convolution with identity.
+
+    During training, runs parallel DW branches (3, 5, 7) + BN identity branch.
+    The identity branch lets the model bypass spatial mixing for small objects.
+    During inference, all branches fuse into a single DW 7x7 convolution.
+    """
+
+    def __init__(self, c: int, act: bool = True):
+        """Initialize RepDWConv module.
+
+        Args:
+            c (int): Number of input and output channels.
+            act (bool): Whether to use activation function.
+        """
+        super().__init__()
+        self.conv7 = Conv(c, c, 7, 1, 3, g=c, act=False)
+        self.conv5 = Conv(c, c, 5, 1, 2, g=c, act=False)
+        self.conv3 = Conv(c, c, 3, 1, 1, g=c, act=False)
+        self.bn_id = nn.BatchNorm2d(c)  # identity branch (RepVGG-style)
+        self.act = nn.SiLU() if act is True else act if isinstance(act, nn.Module) else nn.Identity()
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass: sum of three parallel DW branches + identity."""
+        return self.act(self.conv7(x) + self.conv5(x) + self.conv3(x) + self.bn_id(x))
+
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass after fusing into a single DW 7x7."""
+        return self.act(self.conv(x))
+
+    @torch.no_grad()
+    def fuse(self):
+        """Fuse three DW branches + identity into a single DW 7x7 convolution."""
+        if hasattr(self, "conv"):
+            return  # already fused
+
+        # Fuse each branch's conv + bn
+        conv7 = fuse_conv_and_bn(self.conv7.conv, self.conv7.bn)
+        conv5 = fuse_conv_and_bn(self.conv5.conv, self.conv5.bn)
+        conv3 = fuse_conv_and_bn(self.conv3.conv, self.conv3.bn)
+
+        # Pad smaller kernels to 7x7
+        w7, b7 = conv7.weight, conv7.bias
+        w5, b5 = F.pad(conv5.weight, [1, 1, 1, 1]), conv5.bias
+        w3, b3 = F.pad(conv3.weight, [2, 2, 2, 2]), conv3.bias
+
+        # Identity + BN → equivalent DW 7x7 kernel (center pixel only)
+        bn = self.bn_id
+        gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
+        wi = torch.zeros_like(w7)
+        wi[:, 0, 3, 3] = gamma
+        bi = bn.bias - bn.running_mean * gamma
+
+        # Create fused conv on the same device as the original weights
+        self.conv = nn.Conv2d(
+            w7.shape[0], w7.shape[0], 7, padding=3, groups=w7.shape[0], bias=True, device=w7.device,
+        ).requires_grad_(False)
+        self.conv.weight.data.copy_(w7 + w5 + w3 + wi)
+        self.conv.bias.data.copy_(b7 + b5 + b3 + bi)
+
+        # Cleanup training branches
+        del self.conv7, self.conv5, self.conv3, self.bn_id
+        self.forward = self.forward_fuse
+
+
+class RepLKUIB(nn.Module):
+    """Reparameterized Large-Kernel Universal Inverted Bottleneck.
+
+    Combines UIB structure (MobileNetV4) with multi-branch large-kernel DW
+    reparameterization (UniRepLKNet). Replaces standard Bottleneck in C3k2.
+    MobileNetV5-inspired: GELU(tanh) activation, Layer Scale (1e-5).
+
+    Architecture:
+        Train:  [DW 3x3 || DW 5x5 || DW 7x7] -> Conv 1x1 (GELU expand) -> Conv 1x1 (project) -> γ·out + x
+        Infer:  DW 7x7 (fused)                 -> Conv 1x1 (expand)       -> Conv 1x1 (project, γ absorbed) -> out + x
+    """
+
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 1.0):
+        """Initialize RepLKUIB module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            shortcut (bool): Whether to use shortcut connection.
+            e (float): Expansion ratio for the hidden (expanded) channels.
+        """
+        super().__init__()
+        c_ = max(int(c2 * e), c1)  # expanded channels (at least c1 for channel mixing)
+        _gelu = nn.GELU(approximate="tanh")
+        self.dw = RepDWConv(c1, act=False)
+        # Always use expand(GELU) → project(linear) so gamma can be absorbed into the linear last conv
+        self.pw = nn.Sequential(Conv(c1, c_, 1, 1, act=_gelu), Conv(c_, c2, 1, 1, act=False))
+        self.add = shortcut and c1 == c2
+        # Layer Scale (MobileNetV5): small init stabilizes large-kernel residual branches
+        self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through RepLKUIB block with layer scale."""
+        out = self.pw(self.dw(x))
+        if self.add:
+            return x + out * self.gamma.view(1, -1, 1, 1)
+        return out
+
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass after layer scale is fused into conv weights."""
+        out = self.pw(self.dw(x))
+        return x + out if self.add else out
+
+    def fuse_layer_scale(self):
+        """Absorb layer scale gamma into the last convolution weights (zero-cost at inference)."""
+        if self.gamma is None:
+            return
+        gamma = self.gamma.data
+        last_conv = self.pw[-1]
+        # Fuse BN first if it still exists (modules() DFS visits parent before children)
+        if hasattr(last_conv, "bn"):
+            last_conv.conv = fuse_conv_and_bn(last_conv.conv, last_conv.bn)
+            delattr(last_conv, "bn")
+            last_conv.forward = last_conv.forward_fuse
+        last_conv.conv.weight.data *= gamma.view(-1, 1, 1, 1)
+        if last_conv.conv.bias is not None:
+            last_conv.conv.bias.data *= gamma
+        delattr(self, "gamma")
+        self.gamma = None
+        self.forward = self.forward_fuse
+
+
+class MQAttention(nn.Module):
+    """Multi-Query Attention: Q per-head, K/V shared single-head (MobileNetV5-style).
+
+    Unlike standard multi-head attention where each head has its own K/V projections,
+    MQA uses a single shared K/V projection across all heads, reducing parameters
+    and memory bandwidth while maintaining quality.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
+        """Initialize Multi-Query Attention module.
+
+        Args:
+            dim (int): Input dimension.
+            num_heads (int): Number of attention heads.
+            attn_ratio (float): Attention ratio for key dimension.
+        """
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        self.scale = self.key_dim**-0.5
+        self.nh_kd = self.key_dim * num_heads
+        # Q: full per-head, K/V: single shared projection
+        self.qkv = Conv(dim, self.nh_kd + self.key_dim + self.head_dim, 1, act=False)
+        self.proj = Conv(dim, dim, 1, act=False)
+        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass of MQAttention module.
+
+        Args:
+            x (torch.Tensor): Input tensor.
+
+        Returns:
+            (torch.Tensor): Output tensor after multi-query attention.
+        """
+        B, C, H, W = x.shape
+        N = H * W
+        qkv = self.qkv(x)
+        q, k, v = qkv.split([self.nh_kd, self.key_dim, self.head_dim], dim=1)
+        q = q.view(B, self.num_heads, self.key_dim, N)
+        k = k.view(B, 1, self.key_dim, N)
+        v = v.view(B, 1, self.head_dim, N)
+
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        v_out = (v @ attn.transpose(-2, -1)).view(B, C, H, W)
+        pe_in = v.expand(B, self.num_heads, self.head_dim, N).reshape(B, C, H, W)
+        x = self.proj(v_out + self.pe(pe_in))
+        return x
 
 
 class BottleneckCSP(nn.Module):
@@ -1127,6 +1312,33 @@ class C3k(C3):
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
 
 
+class C3k2RepLK(C2f):
+    """CSP Bottleneck with 2 convolutions using RepLKUIB blocks for efficient large-kernel feature extraction."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 1.0):
+        """Initialize C3k2RepLK module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of RepLKUIB blocks.
+            e (float): Expansion ratio for C2f split channels.
+            attn (bool): Whether to use attention blocks.
+            shortcut (bool): Whether to use shortcut connections.
+            uib_e (float): Expansion ratio for RepLKUIB pointwise layers.
+        """
+        super().__init__(c1, c2, n, shortcut, e=e)
+        self.m = nn.ModuleList(
+            nn.Sequential(
+                RepLKUIB(self.c, self.c, shortcut, e=uib_e),
+                PSABlockMQ(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+            )
+            if attn
+            else RepLKUIB(self.c, self.c, shortcut, e=uib_e)
+            for _ in range(n)
+        )
+
+
 class RepVGGDW(torch.nn.Module):
     """RepVGGDW is a class that represents a depth-wise convolutional block in RepVGG architecture."""
 
@@ -1472,7 +1684,7 @@ class C2PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=self.c // 64) for _ in range(n)))
+        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Process the input tensor through a series of PSA blocks.
@@ -1486,6 +1698,45 @@ class C2PSA(nn.Module):
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
+
+
+class PSABlockMQ(PSABlock):
+    """Position-Sensitive Attention block with Multi-Query Attention.
+
+    Inherits PSABlock, replacing Attention with MQAttention (shared K/V) for reduced
+    parameters and memory bandwidth.
+    """
+
+    def __init__(self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True) -> None:
+        """Initialize PSABlockMQ.
+
+        Args:
+            c (int): Input and output channels.
+            attn_ratio (float): Attention ratio for key dimension.
+            num_heads (int): Number of attention heads.
+            shortcut (bool): Whether to use shortcut connections.
+        """
+        super().__init__(c, attn_ratio=attn_ratio, num_heads=num_heads, shortcut=shortcut)
+        self.attn = MQAttention(c, attn_ratio=attn_ratio, num_heads=num_heads)
+
+
+class C2PSAMQ(C2PSA):
+    """C2PSA module with Multi-Query Attention for enhanced feature extraction.
+
+    Inherits C2PSA, replacing PSABlock with PSABlockMQ (shared K/V) for reduced parameters.
+    """
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
+        """Initialize C2PSAMQ module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of PSABlockMQ modules.
+            e (float): Expansion ratio.
+        """
+        super().__init__(c1, c2, n=n, e=e)
+        self.m = nn.Sequential(*(PSABlockMQ(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n)))
 
 
 class C2fPSA(C2f):

@@ -16,6 +16,7 @@ from ultralytics.nn.modules import (
     C1,
     C2,
     C2PSA,
+    C2PSAMQ,
     C3,
     C3TR,
     ELAN1,
@@ -36,6 +37,7 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
+    C3k2RepLK,
     C3x,
     CBFuse,
     CBLinear,
@@ -59,6 +61,8 @@ from ultralytics.nn.modules import (
     Pose26,
     RepC3,
     RepConv,
+    RepDWConv,
+    RepLKUIB,
     RepNCSPELAN4,
     RepVGGDW,
     ResNetLayer,
@@ -247,6 +251,11 @@ class BaseModel(torch.nn.Module):
                     m.forward = m.forward_fuse  # update forward
                 if isinstance(m, RepVGGDW):
                     m.fuse()
+                    m.forward = m.forward_fuse
+                if isinstance(m, RepDWConv):
+                    m.fuse()
+                if isinstance(m, RepLKUIB):
+                    m.fuse_layer_scale()
                     m.forward = m.forward_fuse
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
@@ -1584,6 +1593,7 @@ def parse_model(d, ch, verbose=True):
             SPPF,
             C2fPSA,
             C2PSA,
+            C2PSAMQ,
             DWConv,
             Focus,
             BottleneckCSP,
@@ -1591,6 +1601,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2RepLK,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1617,6 +1628,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
+            C3k2RepLK,
             C2fAttn,
             C3,
             C3TR,
@@ -1626,6 +1638,7 @@ def parse_model(d, ch, verbose=True):
             C2fPSA,
             C2fCIB,
             C2PSA,
+            C2PSAMQ,
             A2C2f,
         }
     )

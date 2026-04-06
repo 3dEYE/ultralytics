@@ -2,6 +2,7 @@
 
 # Ultralytics YOLO16 object detection model with P3/8 - P5/32 outputs
 # YOLO26 topology + UIBottleneck (large-kernel UIB with layer scale)
+# PTQ-friendly: sigmoid attention (no softmax), SiLU activations, all rep-branches fusible
 
 # Parameters
 nc: 80 # number of classes
@@ -28,7 +29,7 @@ backbone:
   - [-1, 1, SCDown, [1024, 3, 2]] # 7-P5/32
   - [-1, 2, C3k2UIB, [1024]]
   - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
-  - [-1, 2, C2PSA, [1024]] # 10
+  - [-1, 1, PSA, [1024, 0.5, True]] # 10 (sigmoid=True for PTQ)
 
 # YOLO16n head
 head:

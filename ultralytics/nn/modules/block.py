@@ -1368,12 +1368,12 @@ class UIBottleneck(nn.Module):
     """Universal Inverted Bottleneck with Large Kernel and Layer Scale.
 
     Adaptation of RepLKUIB ideas for C3k2:
-        RepDW 7×7 (spatial, no act) → PW 1×1 expand (GELU) → PW 1×1 project (linear) → γ·out + residual
+        RepDW 7×7 (spatial, no act) → PW 1×1 expand (SiLU) → PW 1×1 project (linear) → γ·out + residual
 
     Compared to standard Bottleneck (Conv 3×3 → Conv 3×3, e=1.0):
         - UIB structure (DW before PW) from MobileNetV4
         - Reparameterizable DW 7×7 (4 branches: 3+5+7+identity, fuses to single DW 7×7)
-        - GELU activation from ConvNeXt/MobileNetV5
+        - SiLU activation — PTQ-friendly, consistent with rest of YOLO pipeline
         - Layer Scale (γ init 1e-5) from MobileNetV5 for training stability
 
     At inference, DW fuses to single 7×7 and γ is absorbed into last conv (zero overhead).
@@ -1392,7 +1392,7 @@ class UIBottleneck(nn.Module):
         c_ = int(c2 * e)
         self.dw = RepDWConv(c1, act=False)
         self.pw = nn.Sequential(
-            Conv(c1, c_, 1, 1, act=nn.GELU(approximate="tanh")),
+            Conv(c1, c_, 1, 1),  # SiLU — PTQ-friendly, matches rest of model
             Conv(c_, c2, 1, 1, act=False),
         )
         self.add = shortcut and c1 == c2
@@ -1432,6 +1432,7 @@ class C3k2UIB(C2f):
     """CSP Bottleneck with 2 convolutions using UIBottleneck blocks.
 
     Drop-in replacement for C3k2 with large-kernel UIB blocks and layer scale.
+    Uses PTQ-friendly sigmoid attention when attn=True.
     """
 
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 4.0):
@@ -1450,7 +1451,7 @@ class C3k2UIB(C2f):
         self.m = nn.ModuleList(
             nn.Sequential(
                 UIBottleneck(self.c, self.c, shortcut, e=uib_e),
-                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1), sigmoid=True),
             )
             if attn
             else UIBottleneck(self.c, self.c, shortcut, e=uib_e)
@@ -1617,19 +1618,21 @@ class Attention(nn.Module):
         pe (Conv): Convolutional layer for positional encoding.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5, sigmoid: bool = False):
         """Initialize multi-head attention module.
 
         Args:
             dim (int): Input dimension.
             num_heads (int): Number of attention heads.
             attn_ratio (float): Attention ratio for key dimension.
+            sigmoid (bool): Use sigmoid instead of softmax for PTQ-friendly INT8 quantization.
         """
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.key_dim = int(self.head_dim * attn_ratio)
         self.scale = self.key_dim**-0.5
+        self.sigmoid = sigmoid
         nh_kd = self.key_dim * num_heads
         h = dim + nh_kd * 2
         self.qkv = Conv(dim, h, 1, act=False)
@@ -1653,7 +1656,7 @@ class Attention(nn.Module):
         )
 
         attn = (q.transpose(-2, -1) @ k) * self.scale
-        attn = attn.softmax(dim=-1)
+        attn = attn.sigmoid() if self.sigmoid else attn.softmax(dim=-1)
         x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
         x = self.proj(x)
         return x
@@ -1680,7 +1683,7 @@ class PSABlock(nn.Module):
         >>> output_tensor = psablock(input_tensor)
     """
 
-    def __init__(self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True) -> None:
+    def __init__(self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True, sigmoid: bool = False) -> None:
         """Initialize the PSABlock.
 
         Args:
@@ -1688,10 +1691,11 @@ class PSABlock(nn.Module):
             attn_ratio (float): Attention ratio for key dimension.
             num_heads (int): Number of attention heads.
             shortcut (bool): Whether to use shortcut connections.
+            sigmoid (bool): Use sigmoid attention for PTQ-friendly quantization.
         """
         super().__init__()
 
-        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads)
+        self.attn = Attention(c, attn_ratio=attn_ratio, num_heads=num_heads, sigmoid=sigmoid)
         self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
         self.add = shortcut
 
@@ -1732,13 +1736,14 @@ class PSA(nn.Module):
         >>> output_tensor = psa.forward(input_tensor)
     """
 
-    def __init__(self, c1: int, c2: int, e: float = 0.5):
+    def __init__(self, c1: int, c2: int, e: float = 0.5, sigmoid: bool = False):
         """Initialize PSA module.
 
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
             e (float): Expansion ratio.
+            sigmoid (bool): Use sigmoid attention for PTQ-friendly quantization.
         """
         super().__init__()
         assert c1 == c2
@@ -1746,7 +1751,7 @@ class PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1))
+        self.attn = Attention(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1), sigmoid=sigmoid)
         self.ffn = nn.Sequential(Conv(self.c, self.c * 2, 1), Conv(self.c * 2, self.c, 1, act=False))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1788,7 +1793,7 @@ class C2PSA(nn.Module):
         This module essentially is the same as PSA module, but refactored to allow stacking more PSABlock modules.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, sigmoid: bool = False):
         """Initialize C2PSA module.
 
         Args:
@@ -1796,6 +1801,7 @@ class C2PSA(nn.Module):
             c2 (int): Output channels.
             n (int): Number of PSABlock modules.
             e (float): Expansion ratio.
+            sigmoid (bool): Use sigmoid attention for PTQ-friendly quantization.
         """
         super().__init__()
         assert c1 == c2
@@ -1803,7 +1809,7 @@ class C2PSA(nn.Module):
         self.cv1 = Conv(c1, 2 * self.c, 1, 1)
         self.cv2 = Conv(2 * self.c, c1, 1)
 
-        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n)))
+        self.m = nn.Sequential(*(PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1), sigmoid=sigmoid) for _ in range(n)))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Process the input tensor through a series of PSA blocks.

@@ -1367,16 +1367,16 @@ class C3k2RepLK(C2f):
 class UIBottleneck(nn.Module):
     """Universal Inverted Bottleneck with Large Kernel and Layer Scale.
 
-    Minimal safe adaptation of RepLKUIB ideas for C3k2:
-        DW 7×7 (spatial) → PW 1×1 expand (GELU) → PW 1×1 project (linear) → γ·out + residual
+    Adaptation of RepLKUIB ideas for C3k2:
+        RepDW 7×7 (spatial, no act) → PW 1×1 expand (GELU) → PW 1×1 project (linear) → γ·out + residual
 
     Compared to standard Bottleneck (Conv 3×3 → Conv 3×3, e=1.0):
         - UIB structure (DW before PW) from MobileNetV4
-        - Large kernel 7×7 for receptive field (single conv, standard BN fuse)
+        - Reparameterizable DW 7×7 (4 branches: 3+5+7+identity, fuses to single DW 7×7)
         - GELU activation from ConvNeXt/MobileNetV5
         - Layer Scale (γ init 1e-5) from MobileNetV5 for training stability
 
-    At inference, γ is absorbed into the last conv weights (zero overhead).
+    At inference, DW fuses to single 7×7 and γ is absorbed into last conv (zero overhead).
     """
 
     def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 4.0):
@@ -1390,7 +1390,7 @@ class UIBottleneck(nn.Module):
         """
         super().__init__()
         c_ = int(c2 * e)
-        self.dw = Conv(c1, c1, 7, 1, 3, g=c1, act=False)
+        self.dw = RepDWConv(c1, act=False)
         self.pw = nn.Sequential(
             Conv(c1, c_, 1, 1, act=nn.GELU(approximate="tanh")),
             Conv(c_, c2, 1, 1, act=False),

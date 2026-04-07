@@ -39,7 +39,6 @@ __all__ = (
     "C3k2",
     "C2fUIB",
     "C2PSAMQ",
-    "C2PSAFL",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -1332,10 +1331,10 @@ class UIBottleneck(nn.Module):
 
 
 class C2fUIB(C2f):
-    """C2f with UIBottleneck blocks and optional FocusedLinearAttention.
+    """C2f with UIBottleneck blocks and optional attention.
 
     Uses large-kernel RepDW + Hardswish UIBottleneck blocks with layer scale.
-    When attn=True, appends INT8-friendly FocusedLinearAttention (no softmax).
+    When attn=True, appends PSABlock with ReLU linear attention.
     """
 
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7):
@@ -1355,7 +1354,7 @@ class C2fUIB(C2f):
         self.m = nn.ModuleList(
             nn.Sequential(
                 UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k),
-                PSABlockFL(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
             else UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k)
@@ -1505,7 +1504,12 @@ class C2fCIB(C2f):
 
 
 class Attention(nn.Module):
-    """Attention module that performs self-attention on the input tensor.
+    """ReLU linear attention with DWConv spatial focus.
+
+    Replaces softmax quadratic attention with ReLU feature mapping and depthwise conv
+    for spatial focus, achieving O(N·key_dim·head_dim) complexity instead of O(N²).
+    Scale is handled by BN inside the projection conv (EfficientViT-style).
+    All operations are INT8-quantizable: Conv, ReLU, MatMul — no exp/softmax.
 
     Args:
         dim (int): The input tensor dimension.
@@ -1520,6 +1524,8 @@ class Attention(nn.Module):
         qkv (Conv): Convolutional layer for computing the query, key, and value.
         proj (Conv): Convolutional layer for projecting the attended values.
         pe (Conv): Convolutional layer for positional encoding.
+        focus (Conv): Depthwise convolution on Q for spatial focus (replaces softmax sharpness).
+        relu (nn.ReLU): ReLU module for feature mapping.
     """
 
     def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
@@ -1533,13 +1539,15 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.key_dim = int(self.head_dim * attn_ratio)
+        self.key_dim = max(1, int(self.head_dim * attn_ratio))
         self.scale = self.key_dim**-0.5
         nh_kd = self.key_dim * num_heads
         h = dim + nh_kd * 2
         self.qkv = Conv(dim, h, 1, act=False)
         self.proj = Conv(dim, dim, 1, act=False)
         self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+        self.focus = Conv(nh_kd, nh_kd, 3, 1, g=nh_kd, act=False)
+        self.relu = nn.ReLU(inplace=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the Attention module.
@@ -1553,15 +1561,26 @@ class Attention(nn.Module):
         B, C, H, W = x.shape
         N = H * W
         qkv = self.qkv(x)
-        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
-            [self.key_dim, self.key_dim, self.head_dim], dim=2
+        q, k, v = torch.split(
+            qkv.reshape(B, self.num_heads, self.key_dim * 2 + self.head_dim, N),
+            [self.key_dim, self.key_dim, self.head_dim],
+            dim=2,
         )
 
-        attn = (q.transpose(-2, -1) @ k) * self.scale
-        attn = attn.softmax(dim=-1)
-        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        x = self.proj(x)
-        return x
+        # ReLU feature mapping (INT8-friendly, no softmax)
+        q = self.relu(q.contiguous())
+        k = self.relu(k.contiguous())
+
+        # Spatial focus on Q via depthwise conv (FLatten-style)
+        q = self.focus(q.reshape(B, -1, H, W)).reshape(B, self.num_heads, self.key_dim, N)
+        q = q * self.scale
+
+        # Linear attention via associativity: O(N·kd·hd)
+        kv = torch.matmul(k, v.transpose(-2, -1))  # [B, H, key_dim, head_dim]
+        x = torch.matmul(kv.transpose(-2, -1), q)  # [B, H, head_dim, N]
+
+        x = x.reshape(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
+        return self.proj(x)
 
 
 class PSABlock(nn.Module):
@@ -1761,141 +1780,6 @@ class C2PSAMQ(C2PSA):
         """
         super().__init__(c1, c2, n=n, e=e)
         self.m = nn.Sequential(*(PSABlockMQ(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n)))
-
-
-class FocusedLinearAttention(nn.Module):
-    """Focused Linear Attention — INT8/export-friendly alternative to softmax attention.
-
-    Replaces softmax with ReLU feature mapping and depthwise conv for spatial focus.
-    Uses unnormalized linear attention via associativity: O(N·key_dim·head_dim) instead of O(N²·key_dim).
-    Scale is handled by BN inside the projection conv (EfficientViT-style).
-
-    Based on FLatten Transformer (ICCV 2023) and EfficientViT (CVPR 2023).
-    All operations are INT8-quantizable: Conv, ReLU, MatMul, Add — no exp/softmax/div.
-
-    Quantization notes:
-        - Uses nn.ReLU module (not F.relu) so observers attach correctly.
-        - Uses FloatFunctional for quantization-aware add.
-        - inplace=False on ReLU to avoid breaking observers.
-
-    Attributes:
-        num_heads (int): Number of attention heads.
-        head_dim (int): Dimension of each attention head.
-        key_dim (int): Dimension of the attention key.
-        scale (float): Scaling factor for the attention scores.
-        qkv (Conv): 1x1 convolution for computing query, key, and value.
-        proj (Conv): 1x1 convolution for projecting the output.
-        pe (Conv): Depthwise convolution for positional encoding.
-        focus (Conv): Depthwise convolution on Q for spatial focus (replaces softmax sharpness).
-        relu (nn.ReLU): ReLU module for quantization-friendly feature mapping.
-        ff_out (FloatFunctional): Quantization-aware add for output + PE.
-    """
-
-    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
-        """Initialize Focused Linear Attention module.
-
-        Args:
-            dim (int): Input dimension.
-            num_heads (int): Number of attention heads.
-            attn_ratio (float): Attention ratio for key dimension.
-        """
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = dim // num_heads
-        self.key_dim = max(1, int(self.head_dim * attn_ratio))
-        self.scale = self.key_dim**-0.5
-
-        nh_kd = self.key_dim * num_heads
-        h = dim + nh_kd * 2
-        self.qkv = Conv(dim, h, 1, act=False)
-        self.proj = Conv(dim, dim, 1, act=False)
-        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
-        # Spatial focus: DWConv on Q compensates for loss of softmax sharpness.
-        self.focus = Conv(nh_kd, nh_kd, 3, 1, g=nh_kd, act=False)
-
-        # Module-level ReLU for quantization observer attachment (not F.relu)
-        self.relu = nn.ReLU(inplace=False)
-
-        # FloatFunctional for quantization-aware add (output + PE)
-        self.ff_out = torch.nn.quantized.FloatFunctional()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass of Focused Linear Attention.
-
-        Args:
-            x (torch.Tensor): Input tensor of shape (B, C, H, W).
-
-        Returns:
-            (torch.Tensor): Output tensor after focused linear attention.
-        """
-        B, C, H, W = x.shape
-        N = H * W
-        qkv = self.qkv(x)
-        q, k, v = torch.split(
-            qkv.reshape(B, self.num_heads, self.key_dim * 2 + self.head_dim, N),
-            [self.key_dim, self.key_dim, self.head_dim],
-            dim=2,
-        )
-
-        # ReLU feature mapping — INT8-friendly (module, not functional)
-        # .contiguous() copies views from split so ReLU is safe even if inplace
-        q = self.relu(q.contiguous())
-        k = self.relu(k.contiguous())
-
-        # Spatial focus on Q via depthwise conv (FLatten-style)
-        q = self.focus(q.reshape(B, -1, H, W)).reshape(B, self.num_heads, self.key_dim, N)
-        q = q * self.scale
-
-        # Unnormalized linear attention via associativity: O(N·kd·hd) instead of O(N²)
-        # KV = K @ V^T  →  [B, H, key_dim, head_dim]
-        kv = torch.matmul(k, v.transpose(-2, -1))
-        # x = KV^T @ Q → [B, H, head_dim, N]
-        x = torch.matmul(kv.transpose(-2, -1), q)
-
-        # Reshape and add positional encoding
-        x = x.reshape(B, C, H, W)
-        x = self.ff_out.add(x, self.pe(v.reshape(B, C, H, W)))
-        return self.proj(x)
-
-
-class PSABlockFL(PSABlock):
-    """PSABlock with Focused Linear Attention for INT8-friendly inference.
-
-    Inherits PSABlock, replacing Attention with FocusedLinearAttention
-    (ReLU + DWConv focus instead of softmax).
-    """
-
-    def __init__(self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True) -> None:
-        """Initialize PSABlockFL.
-
-        Args:
-            c (int): Input and output channels.
-            attn_ratio (float): Attention ratio for key dimension.
-            num_heads (int): Number of attention heads.
-            shortcut (bool): Whether to use shortcut connections.
-        """
-        super().__init__(c, attn_ratio=attn_ratio, num_heads=num_heads, shortcut=shortcut)
-        self.attn = FocusedLinearAttention(c, attn_ratio=attn_ratio, num_heads=num_heads)
-
-
-class C2PSAFL(C2PSA):
-    """C2PSA with Focused Linear Attention — INT8 quantization friendly.
-
-    Inherits C2PSA, replacing PSABlock with PSABlockFL (ReLU linear attention + DWConv focus).
-    Drop-in replacement for C2PSA in model configs.
-    """
-
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
-        """Initialize C2PSAFL module.
-
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            n (int): Number of PSABlockFL modules.
-            e (float): Expansion ratio.
-        """
-        super().__init__(c1, c2, n=n, e=e)
-        self.m = nn.Sequential(*(PSABlockFL(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)) for _ in range(n)))
 
 
 class C2fPSA(C2f):

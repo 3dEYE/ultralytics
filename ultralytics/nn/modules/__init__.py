@@ -22,7 +22,6 @@ from .block import (
     C2,
     C2PSA,
     C2PSAMQ,
-    C2PSAFL,
     C3,
     C3TR,
     CIB,

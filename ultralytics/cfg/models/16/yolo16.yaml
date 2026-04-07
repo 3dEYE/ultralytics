@@ -1,8 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# Ultralytics YOLO16 INT8-friendly object detection model with P3/8 - P5/32 outputs
-# Same as yolo16.yaml but with C2PSAFL (Focused Linear Attention) instead of C2PSA
-# All ops INT8-quantizable: no softmax/sigmoid, only Conv + ReLU + MatMul
+# Ultralytics YOLO16 object detection model with P3/8 - P5/32 outputs
+# Uses ReLU linear attention (no softmax) — INT8-quantizable
 
 # Parameters
 nc: 80 # number of classes
@@ -29,7 +28,7 @@ backbone:
   - [-1, 1, SCDown, [1024, 3, 2]] # 7-P5/32
   - [-1, 2, C2fUIB, [1024]]
   - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
-  - [-1, 2, C2PSAFL, [1024]] # 10 — INT8-friendly focused linear attention
+  - [-1, 2, C2PSA, [1024]] # 10
 
 # YOLO16n head
 head:

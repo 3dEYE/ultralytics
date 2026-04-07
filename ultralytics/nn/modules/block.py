@@ -1504,12 +1504,7 @@ class C2fCIB(C2f):
 
 
 class Attention(nn.Module):
-    """ReLU linear attention with DWConv spatial focus.
-
-    Replaces softmax quadratic attention with ReLU feature mapping and depthwise conv
-    for spatial focus, achieving O(N·key_dim·head_dim) complexity instead of O(N²).
-    Scale is handled by BN inside the projection conv (EfficientViT-style).
-    All operations are INT8-quantizable: Conv, ReLU, MatMul — no exp/softmax.
+    """Attention module that performs self-attention on the input tensor.
 
     Args:
         dim (int): The input tensor dimension.
@@ -1524,8 +1519,6 @@ class Attention(nn.Module):
         qkv (Conv): Convolutional layer for computing the query, key, and value.
         proj (Conv): Convolutional layer for projecting the attended values.
         pe (Conv): Convolutional layer for positional encoding.
-        focus (Conv): Depthwise convolution on Q for spatial focus (replaces softmax sharpness).
-        relu (nn.ReLU): ReLU module for feature mapping.
     """
 
     def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
@@ -1539,15 +1532,13 @@ class Attention(nn.Module):
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.key_dim = max(1, int(self.head_dim * attn_ratio))
+        self.key_dim = int(self.head_dim * attn_ratio)
         self.scale = self.key_dim**-0.5
         nh_kd = self.key_dim * num_heads
         h = dim + nh_kd * 2
         self.qkv = Conv(dim, h, 1, act=False)
         self.proj = Conv(dim, dim, 1, act=False)
         self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
-        self.focus = Conv(nh_kd, nh_kd, 3, 1, g=nh_kd, act=False)
-        self.relu = nn.ReLU(inplace=False)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of the Attention module.
@@ -1561,26 +1552,15 @@ class Attention(nn.Module):
         B, C, H, W = x.shape
         N = H * W
         qkv = self.qkv(x)
-        q, k, v = torch.split(
-            qkv.reshape(B, self.num_heads, self.key_dim * 2 + self.head_dim, N),
-            [self.key_dim, self.key_dim, self.head_dim],
-            dim=2,
+        q, k, v = qkv.view(B, self.num_heads, self.key_dim * 2 + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
         )
 
-        # ReLU feature mapping (INT8-friendly, no softmax)
-        q = self.relu(q.contiguous())
-        k = self.relu(k.contiguous())
-
-        # Spatial focus on Q via depthwise conv (FLatten-style)
-        q = self.focus(q.reshape(B, -1, H, W)).reshape(B, self.num_heads, self.key_dim, N)
-        q = q * self.scale
-
-        # Linear attention via associativity: O(N·kd·hd)
-        kv = torch.matmul(k, v.transpose(-2, -1))  # [B, H, key_dim, head_dim]
-        x = torch.matmul(kv.transpose(-2, -1), q)  # [B, H, head_dim, N]
-
-        x = x.reshape(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
-        return self.proj(x)
+        attn = (q.transpose(-2, -1) @ k) * self.scale
+        attn = attn.softmax(dim=-1)
+        x = (v @ attn.transpose(-2, -1)).view(B, C, H, W) + self.pe(v.reshape(B, C, H, W))
+        x = self.proj(x)
+        return x
 
 
 class PSABlock(nn.Module):

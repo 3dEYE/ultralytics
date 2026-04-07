@@ -37,8 +37,8 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
+    "C3k2UIB",
     "C2PSAMQ",
-    "C3k2RepLK",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -52,7 +52,7 @@ __all__ = (
     "MQAttention",
     "PSABlockMQ",
     "RepDWConv",
-    "RepLKUIB",
+    "UIBottleneck",
     "RepNCSPELAN4",
     "RepVGGDW",
     "ResNetLayer",
@@ -487,154 +487,82 @@ class Bottleneck(nn.Module):
         return x + self.cv2(self.cv1(x)) if self.add else self.cv2(self.cv1(x))
 
 
-class DropPath(nn.Module):
-    """Stochastic depth regularization (drop entire residual branch per sample).
-
-    During training, randomly drops the path with probability `drop_prob`.
-    During inference, acts as identity (zero overhead).
-    """
-
-    def __init__(self, drop_prob: float = 0.0):
-        """Initialize DropPath with given drop probability."""
-        super().__init__()
-        self.drop_prob = drop_prob
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply stochastic depth: randomly zero out entire samples in a batch."""
-        if self.drop_prob == 0.0 or not self.training:
-            return x
-        keep = 1 - self.drop_prob
-        mask = x.new_empty(x.shape[0], *((1,) * (x.ndim - 1))).bernoulli_(keep).div_(keep)
-        return x * mask
 
 
 class RepDWConv(nn.Module):
     """Reparameterizable multi-branch depthwise convolution with identity.
 
-    During training, runs parallel DW branches (3, 5, 7) + BN identity branch.
+    During training, runs parallel DW branches (3, 5, …, k) + BN identity branch.
     The identity branch lets the model bypass spatial mixing for small objects.
-    During inference, all branches fuse into a single DW 7x7 convolution.
+    During inference, all branches fuse into a single DW k×k convolution.
     """
 
-    def __init__(self, c: int, act: bool = True):
+    def __init__(self, c: int, k: int = 7, act: bool = True):
         """Initialize RepDWConv module.
 
         Args:
             c (int): Number of input and output channels.
+            k (int): Maximum kernel size (must be odd, ≥ 3). Branches: 3, 5, …, k.
             act (bool): Whether to use activation function.
         """
         super().__init__()
-        self.conv7 = Conv(c, c, 7, 1, 3, g=c, act=False)
-        self.conv5 = Conv(c, c, 5, 1, 2, g=c, act=False)
-        self.conv3 = Conv(c, c, 3, 1, 1, g=c, act=False)
+        self.k = k
+        for ks in range(3, k + 1, 2):
+            setattr(self, f"conv{ks}", Conv(c, c, ks, 1, ks // 2, g=c, act=False))
         self.bn_id = nn.BatchNorm2d(c)  # identity branch (RepVGG-style)
         self.act = nn.SiLU() if act is True else act if isinstance(act, nn.Module) else nn.Identity()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: sum of three parallel DW branches + identity."""
-        return self.act(self.conv7(x) + self.conv5(x) + self.conv3(x) + self.bn_id(x))
+        """Forward pass: sum of parallel DW branches + identity."""
+        out = self.bn_id(x)
+        for ks in range(3, self.k + 1, 2):
+            out = out + getattr(self, f"conv{ks}")(x)
+        return self.act(out)
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass after fusing into a single DW 7x7."""
+        """Forward pass after fusing into a single DW conv."""
         return self.act(self.conv(x))
 
     @torch.no_grad()
     def fuse(self):
-        """Fuse three DW branches + identity into a single DW 7x7 convolution."""
+        """Fuse all DW branches + identity into a single DW k×k convolution."""
         if hasattr(self, "conv"):
             return  # already fused
 
-        # Fuse each branch's conv + bn
-        conv7 = fuse_conv_and_bn(self.conv7.conv, self.conv7.bn)
-        conv5 = fuse_conv_and_bn(self.conv5.conv, self.conv5.bn)
-        conv3 = fuse_conv_and_bn(self.conv3.conv, self.conv3.bn)
+        k = self.k
+        center = k // 2
 
-        # Pad smaller kernels to 7x7
-        w7, b7 = conv7.weight, conv7.bias
-        w5, b5 = F.pad(conv5.weight, [1, 1, 1, 1]), conv5.bias
-        w3, b3 = F.pad(conv3.weight, [2, 2, 2, 2]), conv3.bias
-
-        # Identity + BN → equivalent DW 7x7 kernel (center pixel only)
+        # Identity + BN → equivalent DW k×k kernel (center pixel only)
         bn = self.bn_id
         gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
-        wi = torch.zeros_like(w7)
-        wi[:, 0, 3, 3] = gamma
-        bi = bn.bias - bn.running_mean * gamma
+        ref = getattr(self, f"conv{k}")
+        w_fused = torch.zeros_like(fuse_conv_and_bn(ref.conv, ref.bn).weight)
+        b_fused = torch.zeros(w_fused.shape[0], device=w_fused.device)
+        w_fused[:, 0, center, center] += gamma
+        b_fused += bn.bias - bn.running_mean * gamma
+
+        # Accumulate each branch (pad smaller kernels to k×k)
+        for ks in range(3, k + 1, 2):
+            branch = getattr(self, f"conv{ks}")
+            fused = fuse_conv_and_bn(branch.conv, branch.bn)
+            pad = (k - ks) // 2
+            w_fused += F.pad(fused.weight, [pad, pad, pad, pad]) if pad else fused.weight
+            b_fused += fused.bias
 
         # Create fused conv on the same device as the original weights
         self.conv = nn.Conv2d(
-            w7.shape[0], w7.shape[0], 7, padding=3, groups=w7.shape[0], bias=True, device=w7.device,
+            w_fused.shape[0], w_fused.shape[0], k, padding=center, groups=w_fused.shape[0], bias=True, device=w_fused.device,
         ).requires_grad_(False)
-        self.conv.weight.data.copy_(w7 + w5 + w3 + wi)
-        self.conv.bias.data.copy_(b7 + b5 + b3 + bi)
+        self.conv.weight.data.copy_(w_fused)
+        self.conv.bias.data.copy_(b_fused)
 
         # Cleanup training branches
-        del self.conv7, self.conv5, self.conv3, self.bn_id
+        for ks in range(3, k + 1, 2):
+            delattr(self, f"conv{ks}")
+        del self.bn_id
         self.forward = self.forward_fuse
 
 
-class RepLKUIB(nn.Module):
-    """Reparameterized Large-Kernel Universal Inverted Bottleneck.
-
-    Combines UIB structure (MobileNetV4) with multi-branch large-kernel DW
-    reparameterization (UniRepLKNet). Replaces standard Bottleneck in C3k2.
-    MobileNetV5-inspired: GELU(tanh) activation, Layer Scale (1e-5).
-
-    Architecture:
-        Train:  [DW 3x3 || DW 5x5 || DW 7x7] -> Conv 1x1 (GELU expand) -> Conv 1x1 (project) -> γ·out + x
-        Infer:  DW 7x7 (fused)                 -> Conv 1x1 (expand)       -> Conv 1x1 (project, γ absorbed) -> out + x
-    """
-
-    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 1.0, drop_path: float = 0.0):
-        """Initialize RepLKUIB module.
-
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            shortcut (bool): Whether to use shortcut connection.
-            e (float): Expansion ratio for the hidden (expanded) channels.
-            drop_path (float): Stochastic depth rate (0 = disabled).
-        """
-        super().__init__()
-        c_ = max(int(c2 * e), c1)  # expanded channels (at least c1 for channel mixing)
-        _gelu = nn.GELU(approximate="tanh")
-        self.dw = RepDWConv(c1, act=False)
-        # Always use expand(GELU) → project(linear) so gamma can be absorbed into the linear last conv
-        self.pw = nn.Sequential(Conv(c1, c_, 1, 1, act=_gelu), Conv(c_, c2, 1, 1, act=False))
-        self.add = shortcut and c1 == c2
-        # Layer Scale (MobileNetV5): small init stabilizes large-kernel residual branches
-        self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
-        self.drop_path = DropPath(drop_path) if drop_path > 0.0 and self.add else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through RepLKUIB block with layer scale and optional stochastic depth."""
-        out = self.pw(self.dw(x))
-        if self.add:
-            return x + self.drop_path(out * self.gamma.view(1, -1, 1, 1))
-        return out
-
-    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass after layer scale is fused into conv weights."""
-        out = self.pw(self.dw(x))
-        return x + out if self.add else out
-
-    def fuse_layer_scale(self):
-        """Absorb layer scale gamma into the last convolution weights (zero-cost at inference)."""
-        if self.gamma is None:
-            return
-        gamma = self.gamma.data
-        last_conv = self.pw[-1]
-        # Fuse BN first if it still exists (modules() DFS visits parent before children)
-        if hasattr(last_conv, "bn"):
-            last_conv.conv = fuse_conv_and_bn(last_conv.conv, last_conv.bn)
-            delattr(last_conv, "bn")
-            last_conv.forward = last_conv.forward_fuse
-        last_conv.conv.weight.data *= gamma.view(-1, 1, 1, 1)
-        if last_conv.conv.bias is not None:
-            last_conv.conv.bias.data *= gamma
-        delattr(self, "gamma")
-        self.gamma = None
-        self.forward = self.forward_fuse
 
 
 class MQAttention(nn.Module):
@@ -1335,51 +1263,24 @@ class C3k(C3):
         self.m = nn.Sequential(*(Bottleneck(c_, c_, shortcut, g, k=(k, k), e=1.0) for _ in range(n)))
 
 
-class C3k2RepLK(C2f):
-    """CSP Bottleneck with 2 convolutions using RepLKUIB blocks for efficient large-kernel feature extraction."""
-
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 1.0, drop_path: float = 0.0):
-        """Initialize C3k2RepLK module.
-
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            n (int): Number of RepLKUIB blocks.
-            e (float): Expansion ratio for C2f split channels.
-            attn (bool): Whether to use attention blocks.
-            shortcut (bool): Whether to use shortcut connections.
-            uib_e (float): Expansion ratio for RepLKUIB pointwise layers.
-            drop_path (float): Max stochastic depth rate (linearly increases across blocks).
-        """
-        super().__init__(c1, c2, n, shortcut, e=e)
-        dp_rates = [drop_path * (i + 1) / n for i in range(n)]  # linearly increasing 0→drop_path
-        self.m = nn.ModuleList(
-            nn.Sequential(
-                RepLKUIB(self.c, self.c, shortcut, e=uib_e, drop_path=dp_rates[i]),
-                PSABlockMQ(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
-            )
-            if attn
-            else RepLKUIB(self.c, self.c, shortcut, e=uib_e, drop_path=dp_rates[i])
-            for i in range(n)
-        )
 
 
 class UIBottleneck(nn.Module):
     """Universal Inverted Bottleneck with Large Kernel and Layer Scale.
 
     Adaptation of RepLKUIB ideas for C3k2:
-        RepDW 7×7 (spatial, no act) → PW 1×1 expand (GELU) → PW 1×1 project (linear) → γ·out + residual
+        RepDW k×k (spatial, no act) → PW 1×1 expand (Hardswish) → PW 1×1 project (linear) → γ·out + residual
 
     Compared to standard Bottleneck (Conv 3×3 → Conv 3×3, e=1.0):
         - UIB structure (DW before PW) from MobileNetV4
-        - Reparameterizable DW 7×7 (4 branches: 3+5+7+identity, fuses to single DW 7×7)
-        - GELU activation from ConvNeXt/MobileNetV5
+        - Reparameterizable DW k×k (branches: 3+5+…+k+identity, fuses to single DW k×k)
+        - Hardswish activation for INT8-friendly inference
         - Layer Scale (γ init 1e-5) from MobileNetV5 for training stability
 
-    At inference, DW fuses to single 7×7 and γ is absorbed into last conv (zero overhead).
+    At inference, DW fuses to single k×k and γ is absorbed into last conv (zero overhead).
     """
 
-    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 4.0):
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 2.0, dw_k: int = 7):
         """Initialize UIBottleneck module.
 
         Args:
@@ -1387,12 +1288,13 @@ class UIBottleneck(nn.Module):
             c2 (int): Output channels.
             shortcut (bool): Whether to use shortcut connection.
             e (float): Expansion ratio for the pointwise layers.
+            dw_k (int): Maximum kernel size for RepDWConv.
         """
         super().__init__()
         c_ = int(c2 * e)
-        self.dw = RepDWConv(c1, act=False)
+        self.dw = RepDWConv(c1, k=dw_k, act=False)
         self.pw = nn.Sequential(
-            Conv(c1, c_, 1, 1, act=nn.GELU(approximate="tanh")),
+            Conv(c1, c_, 1, 1, act=nn.Hardswish()),
             Conv(c_, c2, 1, 1, act=False),
         )
         self.add = shortcut and c1 == c2
@@ -1434,7 +1336,7 @@ class C3k2UIB(C2f):
     Drop-in replacement for C3k2 with large-kernel UIB blocks and layer scale.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 4.0):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7):
         """Initialize C3k2UIB module.
 
         Args:
@@ -1445,15 +1347,16 @@ class C3k2UIB(C2f):
             attn (bool): Whether to use attention blocks.
             shortcut (bool): Whether to use shortcut connections.
             uib_e (float): Expansion ratio for UIBottleneck pointwise layers.
+            dw_k (int): Maximum kernel size for RepDWConv in UIBottleneck.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(
             nn.Sequential(
-                UIBottleneck(self.c, self.c, shortcut, e=uib_e),
+                UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else UIBottleneck(self.c, self.c, shortcut, e=uib_e)
+            else UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k)
             for _ in range(n)
         )
 

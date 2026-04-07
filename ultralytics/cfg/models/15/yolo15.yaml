@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-# YOLO15-RepLK v3 — Large-kernel UIB with ConvNeXt-level 4× FFN expansion
-# Architecture: DW 7×7 (reparameterized) → PW expand(4×) → PW project
+# YOLO15 — Large-kernel UIB with Hardswish activation
+# Architecture: RepDW k×k (reparameterized) → PW expand(2×) → PW project
 # Stem: Conv+Conv (width-scaled, YOLO26-style)
 # Quality > YOLO26 at −12-13% GFLOPs (s/m/l scales)
 # xl/2xl: large-capacity variants (uncapped channels) targeting RF-DETR-class quality
@@ -19,20 +19,20 @@ scales:
 backbone:
   - [-1, 1, Conv, [64, 3, 2]]                              # 0  P1/2
   - [-1, 1, Conv, [128, 3, 2]]                             # 1  P2/4
-  - [-1, 2, C3k2RepLK, [256, 0.25]]                        # 2  P2 (spatial, e=1)
+  - [-1, 2, C3k2UIB, [256, 0.25]]                        # 2  P2 (spatial)
   - [-1, 1, Conv, [256, 3, 2]]                             # 3  P3/8
-  - [-1, 2, C3k2RepLK, [512, 0.25, False, True, 4.0]]      # 4  P3 skip→head (FFN 4×)
+  - [-1, 2, C3k2UIB, [512, 0.25]]                          # 4  P3 skip→head
   - [-1, 1, SCDown, [512, 3, 2]]                           # 5  P4/16
-  - [-1, 4, C3k2RepLK, [512, 0.5, False, True, 4.0, 0.1]]  # 6  P4 deep+FFN(4×)+DropPath
+  - [-1, 4, C3k2UIB, [512]]                                # 6  P4 deep
   - [-1, 1, SCDown, [1024, 3, 2]]                          # 7  P5/32
-  - [-1, 4, C3k2RepLK, [1024, 0.5, False, True, 4.0, 0.1]] # 8  P5 deep+FFN(4×)+DropPath
+  - [-1, 4, C3k2UIB, [1024]]                               # 8  P5 deep
   - [-1, 1, SPPF, [1024, 5, 3, True]]                      # 9
   - [-1, 2, C2PSAMQ, [1024]]                               # 10 PSA + MQA attention
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]              # 11
   - [[-1, 6], 1, Concat, [1]]                              # 12 cat backbone P4
-  - [-1, 3, C3k2RepLK, [512, 0.5, False, True, 4.0, 0.05]] # 13 P4 head FFN(4×)+DropPath
+  - [-1, 3, C3k2UIB, [512]] # 13 P4 head
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]              # 14
   - [[-1, 4], 1, Concat, [1]]                              # 15 cat backbone P3
@@ -40,10 +40,10 @@ head:
 
   - [-1, 1, Conv, [256, 3, 2]]                             # 17
   - [[-1, 13], 1, Concat, [1]]                             # 18 cat head P4
-  - [-1, 3, C3k2RepLK, [512, 0.5, False, True, 4.0, 0.05]] # 19 P4 head FFN(4×)+DropPath
+  - [-1, 3, C3k2UIB, [512]] # 19 P4 head
 
   - [-1, 1, Conv, [512, 3, 2]]                             # 20
   - [[-1, 10], 1, Concat, [1]]                             # 21 cat head P5
-  - [-1, 1, C3k2RepLK, [1024, 0.5, True, True, 4.0]]       # 22 P5 attn+FFN(4×)
+  - [-1, 1, C3k2UIB, [1024, 0.5, True]]                    # 22 P5 attn
 
   - [[16, 19, 22], 1, Detect, [nc]]                        # 23

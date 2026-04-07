@@ -1767,14 +1767,15 @@ class FocusedLinearAttention(nn.Module):
     """Focused Linear Attention — INT8/export-friendly alternative to softmax attention.
 
     Replaces softmax with ReLU feature mapping and depthwise conv for spatial focus.
-    Uses normalized linear attention via associativity: O(N·key_dim·head_dim) instead of O(N²·key_dim).
+    Uses unnormalized linear attention via associativity: O(N·key_dim·head_dim) instead of O(N²·key_dim).
+    Scale is handled by BN inside the projection conv (EfficientViT-style).
 
     Based on FLatten Transformer (ICCV 2023) and EfficientViT (CVPR 2023).
-    All operations are INT8-quantizable: Conv, ReLU, MatMul, Add, Div — no exp/softmax.
+    All operations are INT8-quantizable: Conv, ReLU, MatMul, Add — no exp/softmax/div.
 
     Quantization notes:
         - Uses nn.ReLU module (not F.relu) so observers attach correctly.
-        - Uses FloatFunctional for add/add_scalar so PTQ/QAT tracks ranges.
+        - Uses FloatFunctional for quantization-aware add.
         - inplace=False on ReLU to avoid breaking observers.
 
     Attributes:
@@ -1782,31 +1783,27 @@ class FocusedLinearAttention(nn.Module):
         head_dim (int): Dimension of each attention head.
         key_dim (int): Dimension of the attention key.
         scale (float): Scaling factor for the attention scores.
-        eps (float): Epsilon for numerical stability in normalization.
         qkv (Conv): 1x1 convolution for computing query, key, and value.
         proj (Conv): 1x1 convolution for projecting the output.
         pe (Conv): Depthwise convolution for positional encoding.
         focus (Conv): Depthwise convolution on Q for spatial focus (replaces softmax sharpness).
         relu (nn.ReLU): ReLU module for quantization-friendly feature mapping.
         ff_out (FloatFunctional): Quantization-aware add for output + PE.
-        ff_den (FloatFunctional): Quantization-aware add_scalar for denominator stability.
     """
 
-    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5, eps: float = 1e-6):
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
         """Initialize Focused Linear Attention module.
 
         Args:
             dim (int): Input dimension.
             num_heads (int): Number of attention heads.
             attn_ratio (float): Attention ratio for key dimension.
-            eps (float): Epsilon for numerical stability in denominator.
         """
         super().__init__()
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.key_dim = max(1, int(self.head_dim * attn_ratio))
         self.scale = self.key_dim**-0.5
-        self.eps = float(eps)
 
         nh_kd = self.key_dim * num_heads
         h = dim + nh_kd * 2
@@ -1819,9 +1816,8 @@ class FocusedLinearAttention(nn.Module):
         # Module-level ReLU for quantization observer attachment (not F.relu)
         self.relu = nn.ReLU(inplace=False)
 
-        # FloatFunctional for quantization-aware arithmetic
+        # FloatFunctional for quantization-aware add (output + PE)
         self.ff_out = torch.nn.quantized.FloatFunctional()
-        self.ff_den = torch.nn.quantized.FloatFunctional()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass of Focused Linear Attention.
@@ -1850,16 +1846,11 @@ class FocusedLinearAttention(nn.Module):
         q = self.focus(q.reshape(B, -1, H, W)).reshape(B, self.num_heads, self.key_dim, N)
         q = q * self.scale
 
-        # Linear attention via associativity: O(N·kd·hd) instead of O(N²)
+        # Unnormalized linear attention via associativity: O(N·kd·hd) instead of O(N²)
         # KV = K @ V^T  →  [B, H, key_dim, head_dim]
         kv = torch.matmul(k, v.transpose(-2, -1))
-        # numerator = KV^T @ Q → [B, H, head_dim, N]
-        num = torch.matmul(kv.transpose(-2, -1), q)
-
-        # denominator = sum(K)^T @ Q → [B, H, 1, N]  (per-token normalization)
-        den = torch.matmul(k.sum(dim=-1, keepdim=True).transpose(-2, -1), q)
-        den = self.ff_den.add_scalar(den, self.eps)
-        x = num / den
+        # x = KV^T @ Q → [B, H, head_dim, N]
+        x = torch.matmul(kv.transpose(-2, -1), q)
 
         # Reshape and add positional encoding
         x = x.reshape(B, C, H, W)

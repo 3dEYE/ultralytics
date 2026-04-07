@@ -1842,8 +1842,9 @@ class FocusedLinearAttention(nn.Module):
         )
 
         # ReLU feature mapping — INT8-friendly (module, not functional)
-        q = self.relu(q)
-        k = self.relu(k)
+        # .contiguous() copies views from split so ReLU is safe even if inplace
+        q = self.relu(q.contiguous())
+        k = self.relu(k.contiguous())
 
         # Spatial focus on Q via depthwise conv (FLatten-style)
         q = self.focus(q.reshape(B, -1, H, W)).reshape(B, self.num_heads, self.key_dim, N)

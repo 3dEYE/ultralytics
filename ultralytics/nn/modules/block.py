@@ -37,7 +37,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
-    "C3k2UIB",
+    "C2fUIB",
     "C2PSAMQ",
     "C2PSAFL",
     "C3x",
@@ -1331,15 +1331,15 @@ class UIBottleneck(nn.Module):
         self.forward = self.forward_fuse
 
 
-class C3k2UIB(C2f):
-    """CSP Bottleneck with 2 convolutions using UIBottleneck blocks.
+class C2fUIB(C2f):
+    """C2f with UIBottleneck blocks and optional FocusedLinearAttention.
 
-    Drop-in replacement for C3k2 with large-kernel UIB blocks and layer scale.
-    Uses FocusedLinearAttention (INT8-friendly) instead of softmax Attention when attn=True.
+    Uses large-kernel RepDW + Hardswish UIBottleneck blocks with layer scale.
+    When attn=True, appends INT8-friendly FocusedLinearAttention (no softmax).
     """
 
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7):
-        """Initialize C3k2UIB module.
+        """Initialize C2fUIB module.
 
         Args:
             c1 (int): Input channels.

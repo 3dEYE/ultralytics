@@ -38,7 +38,7 @@ from ultralytics.nn.modules import (
     C2fPSA,
     C3Ghost,
     C3k2,
-    C3k2UIB,
+    C2fUIB,
     C3x,
     CBFuse,
     CBLinear,
@@ -1602,7 +1602,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
-            C3k2UIB,
+            C2fUIB,
             RepNCSPELAN4,
             ELAN1,
             ADown,
@@ -1629,7 +1629,7 @@ def parse_model(d, ch, verbose=True):
             C2,
             C2f,
             C3k2,
-            C3k2UIB,
+            C2fUIB,
             C2fAttn,
             C3,
             C3TR,
@@ -1673,7 +1673,7 @@ def parse_model(d, ch, verbose=True):
                 legacy = False
                 if scale in "mlx":
                     args[3] = True
-            if m is C3k2UIB:
+            if m is C2fUIB:
                 legacy = False
             if m is A2C2f:
                 legacy = False

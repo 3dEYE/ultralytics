@@ -1298,7 +1298,7 @@ class UIBottleneck(nn.Module):
             dw_k (int): Maximum kernel size for RepDWConv.
         """
         super().__init__()
-        c_ = int(c2 * e)
+        c_ = max(1, int(c2 * e))
         self.dw = RepDWConv(c1, k=dw_k, act=False)
         self.pw = nn.Sequential(
             Conv(c1, c_, 1, 1, act=nn.Hardswish()),

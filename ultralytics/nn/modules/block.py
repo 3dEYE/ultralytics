@@ -1304,97 +1304,142 @@ class SEB(nn.Module):
 
 
 class UIBottleneck(nn.Module):
-    """Universal Inverted Bottleneck with Large Kernel and Layer Scale.
+    """Universal Inverted Bottleneck with star-style multiplicative fusion, SE, and Layer Scale.
 
-    Adaptation of RepLKUIB ideas for C3k2:
-        RepDW k×k (spatial, no act) → SE → PW 1×1 expand (Hardswish) → PW 1×1 project (linear) → γ·out + residual
+    Architecture:
+        x -> RepDW kxk (spatial) -----------+
+                                            * -> SE -> PW expand (Hardswish) -> PW project (linear) -> gamma*out + residual
+        x -> 1x1 star projection + gate ----+
 
-    Compared to standard Bottleneck (Conv 3×3 → Conv 3×3, e=1.0):
-        - UIB structure (DW before PW) from MobileNetV4
-        - Reparameterizable DW k×k (branches: 3+5+…+k+identity, fuses to single DW k×k)
-        - Optional SE after DW for cross-channel recalibration (INT8-friendly Hardsigmoid)
-        - Hardswish activation for INT8-friendly inference
-        - Layer Scale (γ init 1e-5) from MobileNetV5 for training stability
-
-    At inference, DW fuses to single k×k and γ is absorbed into last conv (zero overhead).
+    Notes:
+        - The DW path captures spatial context per channel.
+        - The star branch produces a bounded channel-mixing gate from the input.
+        - Element-wise multiplication injects cross-channel conditioning into the spatial path.
+        - SE optionally recalibrates channels after the multiplicative fusion.
+        - At inference, the RepDW branches can be fused into a single DW kxk conv,
+          and gamma can be absorbed into the last pointwise conv.
+        - The star branch itself remains explicit at inference.
     """
 
-    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 2.0, dw_k: int = 7, se_r: int = 4):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        shortcut: bool = True,
+        e: float = 2.0,
+        dw_k: int = 7,
+        se_r: int = 4,
+        use_star: bool = True,
+    ):
         """Initialize UIBottleneck module.
 
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
-            shortcut (bool): Whether to use shortcut connection.
-            e (float): Expansion ratio for the pointwise layers.
+            shortcut (bool): Whether to use residual connection when c1 == c2.
+            e (float): Expansion ratio for the pointwise hidden channels.
             dw_k (int): Maximum kernel size for RepDWConv.
-            se_r (int): SE reduction ratio (0 to disable).
+            se_r (int): SE reduction ratio. Set to 0 to disable SE.
+            use_star (bool): Whether to use star-style multiplicative fusion.
         """
         super().__init__()
         c_ = max(1, int(c2 * e))
+
         self.dw = RepDWConv(c1, k=dw_k, act=False)
+
+        self.use_star = use_star
+        if use_star:
+            self.star_proj = nn.Conv2d(c1, c1, kernel_size=1, bias=True)
+            self.star_gate = nn.Hardsigmoid(inplace=False)
+        else:
+            self.star_proj = None
+            self.star_gate = None
+
         self.se = SEB(c1, r=se_r) if se_r > 0 else nn.Identity()
+
         self.pw = nn.Sequential(
             Conv(c1, c_, 1, 1, act=nn.Hardswish()),
             Conv(c_, c2, 1, 1, act=False),
         )
+
         self.add = shortcut and c1 == c2
         self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
 
+    def _mix(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply DW path, optional star-style multiplicative fusion, and SE."""
+        out = self.dw(x)
+        if self.use_star:
+            gate = self.star_gate(self.star_proj(x))
+            out = out * gate
+        return self.se(out)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with layer scale and residual."""
-        out = self.pw(self.se(self.dw(x)))
+        """Forward pass with optional star fusion, SE, layer scale, and residual."""
+        out = self.pw(self._mix(x))
         if self.add:
             return x + out * self.gamma.view(1, -1, 1, 1)
         return out
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass after layer scale is fused into conv weights."""
-        out = self.pw(self.se(self.dw(x)))
+        """Forward pass after layer scale has been absorbed into the last conv."""
+        out = self.pw(self._mix(x))
         return x + out if self.add else out
 
+    @torch.no_grad()
     def fuse_layer_scale(self):
-        """Absorb layer scale gamma into the last convolution weights (zero-cost at inference)."""
+        """Absorb layer scale gamma into the last pointwise convolution."""
         if self.gamma is None:
             return
+
         gamma = self.gamma.data
         last_conv = self.pw[-1]
+
         if hasattr(last_conv, "bn"):
             last_conv.conv = fuse_conv_and_bn(last_conv.conv, last_conv.bn)
             delattr(last_conv, "bn")
             last_conv.forward = last_conv.forward_fuse
+
         last_conv.conv.weight.data *= gamma.view(-1, 1, 1, 1)
         if last_conv.conv.bias is not None:
             last_conv.conv.bias.data *= gamma
+
         delattr(self, "gamma")
         self.gamma = None
         self.forward = self.forward_fuse
 
     @torch.no_grad()
     def fuse(self):
-        """Fuse RepDWConv branches and absorb layer scale into conv weights."""
+        """Fuse RepDW branches and absorb layer scale for inference.
+
+        Note:
+            This fuses the RepDWConv inside `self.dw` and absorbs gamma into the
+            last pointwise conv. The star projection/gate branch remains explicit.
+        """
         if hasattr(self.dw, "fuse"):
             self.dw.fuse()
         self.fuse_layer_scale()
 
 
 class C2fUIB(C2f):
-    """C2f module with UIBottleneck blocks, optional SE attention, and optional PSA.
+    """C2f module with UIBottleneck blocks featuring star-style fusion, SE, and optional PSA.
 
-    Each UIBottleneck follows the Universal Inverted Bottleneck pattern:
-        RepDW k×k (spatial) → SE (cross-channel) → PW expand (Hardswish) → PW project (linear) → LayerScale + residual
+    Each UIBottleneck follows the star + Universal Inverted Bottleneck pattern:
+        x -> RepDW kxk (spatial) -----------+
+                                            * -> SE -> PW expand -> PW project -> LayerScale + residual
+        x -> 1x1 star projection + gate ----+
 
     Key features configurable from YAML:
+        - use_star: Star-style multiplicative fusion for cross-channel spatial mixing (default True).
         - uib_e: PW expansion ratio (default 2.0) — controls capacity vs. cost.
         - dw_k: RepDWConv max kernel size (default 7) — larger = more spatial context.
         - se_r: SE reduction ratio (default 4, 0 to disable) — cross-channel recalibration.
         - attn: append PSABlock after each UIBottleneck for global self-attention.
 
-    At inference all RepDW branches fuse into a single DW k×k conv and LayerScale γ
-    is absorbed into the last PW conv, adding zero overhead.
+    At inference all RepDW branches fuse into a single DW kxk conv and LayerScale gamma
+    is absorbed into the last PW conv. The star branch remains explicit.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, se_r: int = 4):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, se_r: int = 4, use_star: bool = True):
         """Initialize C2fUIB module.
 
         Args:
@@ -1407,15 +1452,16 @@ class C2fUIB(C2f):
             uib_e (float): Expansion ratio for UIBottleneck pointwise layers.
             dw_k (int): Maximum kernel size for RepDWConv in UIBottleneck.
             se_r (int): SE reduction ratio for UIBottleneck (0 to disable).
+            use_star (bool): Whether to use star-style multiplicative fusion.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(
             nn.Sequential(
-                UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r),
+                UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r)
+            else UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star)
             for _ in range(n)
         )
 

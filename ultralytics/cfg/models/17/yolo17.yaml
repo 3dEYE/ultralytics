@@ -1,12 +1,12 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
 # YOLO17: YOLO16 architecture with optimized depth for COCO
-# Variant R: P3/P4 path emphasis (small+medium objects = 75% of COCO)
-#   - backbone P3, P4 and head P3 get n=6 (3 blocks at d=0.5)
-#   - everything else n=3 (2 blocks at d=0.5)
-#   - stays within YOLO26 GFLOPs budget at every scale
+# Star-gated UIBottleneck + SE + RepDW7x7 + LayerScale
+#   - all C2fUIB use n=5 (2 blocks at d=0.5, 5 blocks at d=1.0)
+#   - non-deep stages n=3 (2 blocks at d=0.5, 3 blocks at d=1.0)
+#   - fits within YOLO26 GFLOPs budget at every scale
 #
-# vs YOLO26 budget:  n=6.1/6.1  s=22.3/22.8  m=69.9/75.4  l=89.6/93.8  x=198.4/209.5
+# vs YOLO26 budget:  n=5.9/6.1  s=22.0/22.8  m=68.2/75.4  l=90.4/93.8  x=200.5/209.5
 
 # Parameters
 nc: 80 # number of classes
@@ -27,9 +27,9 @@ backbone:
   - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
   - [-1, 3, C2fUIB, [256, 0.25, False, True, 2.0, 5]] # 2-P2 features
   - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 6, C2fUIB, [512, 0.25, False, True, 2.0, 5]] # 4-P3 features (deep)
+  - [-1, 5, C2fUIB, [512, 0.25, False, True, 2.0, 5]] # 4-P3 features (deep)
   - [-1, 1, SCDown, [512, 3, 2]] # 5-P4/16
-  - [-1, 6, C2fUIB, [512]] # 6-P4 features (deep)
+  - [-1, 5, C2fUIB, [512]] # 6-P4 features (deep)
   - [-1, 1, SCDown, [1024, 3, 2]] # 7-P5/32
   - [-1, 3, C2fUIB, [1024]] # 8-P5 features
   - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
@@ -43,7 +43,7 @@ head:
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]] # cat backbone P3
-  - [-1, 6, C2fUIB, [256, 0.5, False, True, 2.0, 5]] # 16 (P3/8-small, deep)
+  - [-1, 5, C2fUIB, [256, 0.5, False, True, 2.0, 5]] # 16 (P3/8-small, deep)
 
   - [-1, 1, Conv, [256, 3, 2]]
   - [[-1, 13], 1, Concat, [1]] # cat head P4

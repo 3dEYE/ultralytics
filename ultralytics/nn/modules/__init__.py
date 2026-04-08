@@ -59,6 +59,7 @@ from .block import (
     Proto,
     RepC3,
     RepDWConv,
+    SEB,
     UIBottleneck,
     RepNCSPELAN4,
     RepVGGDW,

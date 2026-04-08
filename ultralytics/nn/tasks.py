@@ -255,7 +255,7 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, RepDWConv):
                     m.fuse()
                 if isinstance(m, UIBottleneck):
-                    m.fuse_layer_scale()
+                    m.fuse()
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
             self.info(verbose=verbose)

@@ -52,6 +52,7 @@ __all__ = (
     "MQAttention",
     "PSABlockMQ",
     "RepDWConv",
+    "SEB",
     "UIBottleneck",
     "RepNCSPELAN4",
     "RepVGGDW",
@@ -1272,22 +1273,53 @@ class C3k(C3):
 
 
 
+class SEB(nn.Module):
+    """Squeeze-and-Excitation Block with INT8-friendly activations.
+
+    GAP → Conv1×1(c→c//r) → ReLU → Conv1×1(c//r→c) → Hardsigmoid → scale.
+    Adds cross-channel recalibration after depthwise convolution.
+    """
+
+    def __init__(self, c: int, r: int = 4):
+        """Initialize SEB module.
+
+        Args:
+            c (int): Number of input/output channels.
+            r (int): Reduction ratio for the bottleneck.
+        """
+        super().__init__()
+        assert r >= 1, f"r must be >= 1, got {r}"
+        cm = max(1, c // r)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.fc = nn.Sequential(
+            nn.Conv2d(c, cm, 1, bias=True),
+            nn.ReLU(inplace=False),
+            nn.Conv2d(cm, c, 1, bias=True),
+            nn.Hardsigmoid(inplace=False),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply channel attention to input tensor."""
+        return x * self.fc(self.pool(x))
+
+
 class UIBottleneck(nn.Module):
     """Universal Inverted Bottleneck with Large Kernel and Layer Scale.
 
     Adaptation of RepLKUIB ideas for C3k2:
-        RepDW k×k (spatial, no act) → PW 1×1 expand (Hardswish) → PW 1×1 project (linear) → γ·out + residual
+        RepDW k×k (spatial, no act) → SE → PW 1×1 expand (Hardswish) → PW 1×1 project (linear) → γ·out + residual
 
     Compared to standard Bottleneck (Conv 3×3 → Conv 3×3, e=1.0):
         - UIB structure (DW before PW) from MobileNetV4
         - Reparameterizable DW k×k (branches: 3+5+…+k+identity, fuses to single DW k×k)
+        - Optional SE after DW for cross-channel recalibration (INT8-friendly Hardsigmoid)
         - Hardswish activation for INT8-friendly inference
         - Layer Scale (γ init 1e-5) from MobileNetV5 for training stability
 
     At inference, DW fuses to single k×k and γ is absorbed into last conv (zero overhead).
     """
 
-    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 2.0, dw_k: int = 7):
+    def __init__(self, c1: int, c2: int, shortcut: bool = True, e: float = 2.0, dw_k: int = 7, se_r: int = 4):
         """Initialize UIBottleneck module.
 
         Args:
@@ -1296,10 +1328,12 @@ class UIBottleneck(nn.Module):
             shortcut (bool): Whether to use shortcut connection.
             e (float): Expansion ratio for the pointwise layers.
             dw_k (int): Maximum kernel size for RepDWConv.
+            se_r (int): SE reduction ratio (0 to disable).
         """
         super().__init__()
         c_ = max(1, int(c2 * e))
         self.dw = RepDWConv(c1, k=dw_k, act=False)
+        self.se = SEB(c1, r=se_r) if se_r > 0 else nn.Identity()
         self.pw = nn.Sequential(
             Conv(c1, c_, 1, 1, act=nn.Hardswish()),
             Conv(c_, c2, 1, 1, act=False),
@@ -1309,14 +1343,14 @@ class UIBottleneck(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass with layer scale and residual."""
-        out = self.pw(self.dw(x))
+        out = self.pw(self.se(self.dw(x)))
         if self.add:
             return x + out * self.gamma.view(1, -1, 1, 1)
         return out
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass after layer scale is fused into conv weights."""
-        out = self.pw(self.dw(x))
+        out = self.pw(self.se(self.dw(x)))
         return x + out if self.add else out
 
     def fuse_layer_scale(self):
@@ -1336,14 +1370,31 @@ class UIBottleneck(nn.Module):
         self.gamma = None
         self.forward = self.forward_fuse
 
+    @torch.no_grad()
+    def fuse(self):
+        """Fuse RepDWConv branches and absorb layer scale into conv weights."""
+        if hasattr(self.dw, "fuse"):
+            self.dw.fuse()
+        self.fuse_layer_scale()
+
 
 class C2fUIB(C2f):
-    """C2f with UIBottleneck blocks and optional attention.
+    """C2f module with UIBottleneck blocks, optional SE attention, and optional PSA.
 
-    Uses large-kernel RepDW + Hardswish UIBottleneck blocks with layer scale.
+    Each UIBottleneck follows the Universal Inverted Bottleneck pattern:
+        RepDW k×k (spatial) → SE (cross-channel) → PW expand (Hardswish) → PW project (linear) → LayerScale + residual
+
+    Key features configurable from YAML:
+        - uib_e: PW expansion ratio (default 2.0) — controls capacity vs. cost.
+        - dw_k: RepDWConv max kernel size (default 7) — larger = more spatial context.
+        - se_r: SE reduction ratio (default 4, 0 to disable) — cross-channel recalibration.
+        - attn: append PSABlock after each UIBottleneck for global self-attention.
+
+    At inference all RepDW branches fuse into a single DW k×k conv and LayerScale γ
+    is absorbed into the last PW conv, adding zero overhead.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, se_r: int = 4):
         """Initialize C2fUIB module.
 
         Args:
@@ -1351,19 +1402,20 @@ class C2fUIB(C2f):
             c2 (int): Output channels.
             n (int): Number of UIBottleneck blocks.
             e (float): Expansion ratio for C2f split channels.
-            attn (bool): Whether to use attention blocks.
+            attn (bool): Whether to append PSABlock after each UIBottleneck.
             shortcut (bool): Whether to use shortcut connections.
             uib_e (float): Expansion ratio for UIBottleneck pointwise layers.
             dw_k (int): Maximum kernel size for RepDWConv in UIBottleneck.
+            se_r (int): SE reduction ratio for UIBottleneck (0 to disable).
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(
             nn.Sequential(
-                UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k),
+                UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k)
+            else UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r)
             for _ in range(n)
         )
 

@@ -1385,6 +1385,20 @@ class UIBottleneck(nn.Module):
         out = self.pw(self._mix(x))
         return x + out if self.add else out
 
+    def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
+        """Minimal inference forward with flat Conv2d modules and functional activations."""
+        out = self.dw_conv(x)
+        if self.use_star:
+            out = out * F.hardsigmoid(self.star_proj(x))
+        if self._has_se:
+            s = F.adaptive_avg_pool2d(out, 1)
+            s = F.relu(self.se_fc1(s))
+            s = F.hardsigmoid(self.se_fc2(s))
+            out = out * s
+        out = F.hardswish(self.pw1(out))
+        out = self.pw2(out)
+        return x + out if self.add else out
+
     @torch.no_grad()
     def fuse_layer_scale(self):
         """Absorb layer scale gamma into the last pointwise convolution."""
@@ -1409,15 +1423,62 @@ class UIBottleneck(nn.Module):
 
     @torch.no_grad()
     def fuse(self):
-        """Fuse RepDW branches and absorb layer scale for inference.
+        """Fuse all sub-modules into flat Conv2d layers for minimal inference overhead.
 
-        Note:
-            This fuses the RepDWConv inside `self.dw` and absorbs gamma into the
-            last pointwise conv. The star projection/gate branch remains explicit.
+        Phase 1 — algebraic fusions:
+            - RepDW multi-branch → single DW Conv2d
+            - BatchNorm → absorbed into Conv2d weights
+            - LayerScale gamma → absorbed into last PW Conv2d
+
+        Phase 2 — flatten module tree:
+            - Extract raw Conv2d from all container modules
+            - Delete containers (RepDWConv, SEB, Sequential, Conv wrappers)
+            - Inline activations as F.hardsigmoid / F.relu / F.hardswish
+            - Result: UIBottleneck holds only 6 Conv2d children (vs 21 before)
         """
+        if hasattr(self, "dw_conv"):
+            return  # already flattened
+
+        # --- Phase 1: algebraic fusions ---
         if hasattr(self.dw, "fuse"):
             self.dw.fuse()
+
+        for m in self.pw:
+            if isinstance(m, Conv) and hasattr(m, "bn"):
+                m.conv = fuse_conv_and_bn(m.conv, m.bn)
+                delattr(m, "bn")
+                m.forward = m.forward_fuse
+
         self.fuse_layer_scale()
+
+        # --- Phase 2: flatten module tree ---
+        # Extract raw Conv2d from containers (local refs keep them alive)
+        dw_conv = self.dw.conv
+        pw1 = self.pw[0].conv
+        pw2 = self.pw[1].conv
+
+        has_se = isinstance(self.se, SEB)
+        if has_se:
+            se_fc1 = self.se.fc[0]
+            se_fc2 = self.se.fc[2]
+
+        # Delete all container modules
+        del self.dw
+        del self.pw
+        del self.se
+        if self.use_star and self.star_gate is not None:
+            del self.star_gate
+
+        # Register flat Conv2d as direct children
+        self.dw_conv = dw_conv
+        self.pw1 = pw1
+        self.pw2 = pw2
+        self._has_se = has_se
+        if has_se:
+            self.se_fc1 = se_fc1
+            self.se_fc2 = se_fc2
+
+        self.forward = self._forward_flat
 
 
 class C2fUIB(C2f):

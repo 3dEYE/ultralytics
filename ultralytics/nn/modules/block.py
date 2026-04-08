@@ -530,28 +530,35 @@ class RepDWConv(nn.Module):
             return  # already fused
 
         k = self.k
+        assert k >= 3 and k % 2 == 1, f"k must be odd and >= 3, got {k}"
         center = k // 2
 
         # Identity + BN → equivalent DW k×k kernel (center pixel only)
         bn = self.bn_id
-        gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
         ref = getattr(self, f"conv{k}")
-        w_fused = torch.zeros_like(fuse_conv_and_bn(ref.conv, ref.bn).weight)
-        b_fused = torch.zeros(w_fused.shape[0], device=w_fused.device)
+        c = ref.conv.out_channels
+        device = ref.conv.weight.device
+        dtype = ref.conv.weight.dtype
+
+        gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
+
+        w_fused = torch.zeros(c, 1, k, k, device=device, dtype=dtype)
+        b_fused = torch.zeros(c, device=device, dtype=dtype)
         w_fused[:, 0, center, center] += gamma
         b_fused += bn.bias - bn.running_mean * gamma
 
         # Accumulate each branch (pad smaller kernels to k×k)
         for ks in range(3, k + 1, 2):
             branch = getattr(self, f"conv{ks}")
-            fused = fuse_conv_and_bn(branch.conv, branch.bn)
+            fused = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
             pad = (k - ks) // 2
             w_fused += F.pad(fused.weight, [pad, pad, pad, pad]) if pad else fused.weight
-            b_fused += fused.bias
+            if fused.bias is not None:
+                b_fused += fused.bias
 
         # Create fused conv on the same device as the original weights
         self.conv = nn.Conv2d(
-            w_fused.shape[0], w_fused.shape[0], k, padding=center, groups=w_fused.shape[0], bias=True, device=w_fused.device,
+            c, c, k, stride=1, padding=center, groups=c, bias=True, device=device, dtype=dtype,
         ).requires_grad_(False)
         self.conv.weight.data.copy_(w_fused)
         self.conv.bias.data.copy_(b_fused)

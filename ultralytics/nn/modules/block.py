@@ -1341,7 +1341,6 @@ class C2fUIB(C2f):
     """C2f with UIBottleneck blocks and optional attention.
 
     Uses large-kernel RepDW + Hardswish UIBottleneck blocks with layer scale.
-    When attn=True, appends PSABlock with ReLU linear attention.
     """
 
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7):

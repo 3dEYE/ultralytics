@@ -61,7 +61,6 @@ from ultralytics.nn.modules import (
     Pose26,
     RepC3,
     RepConv,
-    RepDWConv,
     StarBottleneck,
     RepNCSPELAN4,
     RepVGGDW,
@@ -252,8 +251,6 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
-                if isinstance(m, RepDWConv):
-                    m.fuse()
                 if isinstance(m, StarBottleneck):
                     m.fuse()
                 if isinstance(m, Detect) and getattr(m, "end2end", False):

@@ -51,7 +51,6 @@ __all__ = (
     "RepC3",
     "MQAttention",
     "PSABlockMQ",
-    "RepDWConv",
     "SEB",
     "StarBottleneck",
     "RepNCSPELAN4",
@@ -489,86 +488,6 @@ class Bottleneck(nn.Module):
 
 
 
-
-class RepDWConv(nn.Module):
-    """Reparameterizable multi-branch depthwise convolution with identity.
-
-    During training, runs parallel DW branches (3, 5, …, k) + BN identity branch.
-    The identity branch lets the model bypass spatial mixing for small objects.
-    During inference, all branches fuse into a single DW k×k convolution.
-    """
-
-    def __init__(self, c: int, k: int = 7, act: bool = True):
-        """Initialize RepDWConv module.
-
-        Args:
-            c (int): Number of input and output channels.
-            k (int): Maximum kernel size (must be odd, ≥ 3). Branches: 3, 5, …, k.
-            act (bool): Whether to use activation function.
-        """
-        super().__init__()
-        self.k = k
-        for ks in range(3, k + 1, 2):
-            setattr(self, f"conv{ks}", Conv(c, c, ks, 1, ks // 2, g=c, act=False))
-        self.bn_id = nn.BatchNorm2d(c)  # identity branch (RepVGG-style)
-        self.act = nn.SiLU() if act is True else act if isinstance(act, nn.Module) else nn.Identity()
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass: sum of parallel DW branches + identity."""
-        out = self.bn_id(x)
-        for ks in range(3, self.k + 1, 2):
-            out = out + getattr(self, f"conv{ks}")(x)
-        return self.act(out)
-
-    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass after fusing into a single DW conv."""
-        return self.act(self.conv(x))
-
-    @torch.no_grad()
-    def fuse(self):
-        """Fuse all DW branches + identity into a single DW k×k convolution."""
-        if hasattr(self, "conv"):
-            return  # already fused
-
-        k = self.k
-        assert k >= 3 and k % 2 == 1, f"k must be odd and >= 3, got {k}"
-        center = k // 2
-
-        # Identity + BN → equivalent DW k×k kernel (center pixel only)
-        bn = self.bn_id
-        ref = getattr(self, f"conv{k}")
-        c = ref.conv.out_channels
-        device = ref.conv.weight.device
-        dtype = ref.conv.weight.dtype
-
-        gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
-
-        w_fused = torch.zeros(c, 1, k, k, device=device, dtype=dtype)
-        b_fused = torch.zeros(c, device=device, dtype=dtype)
-        w_fused[:, 0, center, center] += gamma
-        b_fused += bn.bias - bn.running_mean * gamma
-
-        # Accumulate each branch (pad smaller kernels to k×k)
-        for ks in range(3, k + 1, 2):
-            branch = getattr(self, f"conv{ks}")
-            fused = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
-            pad = (k - ks) // 2
-            w_fused += F.pad(fused.weight, [pad, pad, pad, pad]) if pad else fused.weight
-            if fused.bias is not None:
-                b_fused += fused.bias
-
-        # Create fused conv on the same device as the original weights
-        self.conv = nn.Conv2d(
-            c, c, k, stride=1, padding=center, groups=c, bias=True, device=device, dtype=dtype,
-        ).requires_grad_(False)
-        self.conv.weight.data.copy_(w_fused)
-        self.conv.bias.data.copy_(b_fused)
-
-        # Cleanup training branches
-        for ks in range(3, k + 1, 2):
-            delattr(self, f"conv{ks}")
-        del self.bn_id
-        self.forward = self.forward_fuse
 
 
 
@@ -1312,12 +1231,13 @@ class StarBottleneck(nn.Module):
         x -> 1x1 star projection + gate ----+
 
     Notes:
-        - The DW path captures spatial context per channel.
+        - The DW path uses reparameterizable multi-branch depthwise convolution
+          (branches 3, 5, …, k) plus a BN identity branch.  All branches fuse into
+          a single DW kxk conv at inference.
         - The star branch produces a bounded channel-mixing gate from the input.
         - Element-wise multiplication injects cross-channel conditioning into the spatial path.
         - SE optionally recalibrates channels after the multiplicative fusion.
-        - At inference, the RepDW branches can be fused into a single DW kxk conv,
-          and gamma can be absorbed into the last pointwise conv.
+        - At inference, gamma is absorbed into the last pointwise conv.
         - The star branch itself remains explicit at inference.
     """
 
@@ -1338,14 +1258,18 @@ class StarBottleneck(nn.Module):
             c2 (int): Output channels.
             shortcut (bool): Whether to use residual connection when c1 == c2.
             e (float): Expansion ratio for the pointwise hidden channels.
-            dw_k (int): Maximum kernel size for RepDWConv.
+            dw_k (int): Maximum kernel size for depthwise convolution (must be odd, ≥ 3).
             se_r (int): SE reduction ratio. Set to 0 to disable SE.
             use_star (bool): Whether to use star-style multiplicative fusion.
         """
         super().__init__()
         c_ = max(1, int(c2 * e))
 
-        self.dw = RepDWConv(c1, k=dw_k, act=False)
+        # DW multi-branch: parallel DW convs (3, 5, …, k) + BN identity
+        self.dw_k = dw_k
+        for ks in range(3, dw_k + 1, 2):
+            setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=c1, act=False))
+        self.dw_bn_id = nn.BatchNorm2d(c1)
 
         self.use_star = use_star
         if use_star:
@@ -1367,7 +1291,9 @@ class StarBottleneck(nn.Module):
 
     def _mix(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DW path, optional star-style multiplicative fusion, and SE."""
-        out = self.dw(x)
+        out = self.dw_bn_id(x)
+        for ks in range(3, self.dw_k + 1, 2):
+            out = out + getattr(self, f"dw_conv{ks}")(x)
         if self.use_star:
             gate = self.star_gate(self.star_proj(x))
             out = out * gate
@@ -1422,26 +1348,64 @@ class StarBottleneck(nn.Module):
         self.forward = self.forward_fuse
 
     @torch.no_grad()
+    def _fuse_dw(self):
+        """Fuse all DW branches + identity into a single DW kxk convolution."""
+        k = self.dw_k
+        assert k >= 3 and k % 2 == 1, f"k must be odd and >= 3, got {k}"
+        center = k // 2
+
+        bn = self.dw_bn_id
+        ref = getattr(self, f"dw_conv{k}")
+        c = ref.conv.out_channels
+        device = ref.conv.weight.device
+        dtype = ref.conv.weight.dtype
+
+        gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
+
+        w_fused = torch.zeros(c, 1, k, k, device=device, dtype=dtype)
+        b_fused = torch.zeros(c, device=device, dtype=dtype)
+        w_fused[:, 0, center, center] += gamma
+        b_fused += bn.bias - bn.running_mean * gamma
+
+        for ks in range(3, k + 1, 2):
+            branch = getattr(self, f"dw_conv{ks}")
+            fused_branch = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
+            pad = (k - ks) // 2
+            w_fused += F.pad(fused_branch.weight, [pad, pad, pad, pad]) if pad else fused_branch.weight
+            if fused_branch.bias is not None:
+                b_fused += fused_branch.bias
+
+        conv = nn.Conv2d(
+            c, c, k, stride=1, padding=center, groups=c, bias=True, device=device, dtype=dtype,
+        ).requires_grad_(False)
+        conv.weight.data.copy_(w_fused)
+        conv.bias.data.copy_(b_fused)
+
+        for ks in range(3, k + 1, 2):
+            delattr(self, f"dw_conv{ks}")
+        del self.dw_bn_id
+        return conv
+
+    @torch.no_grad()
     def fuse(self):
         """Fuse all sub-modules into flat Conv2d layers for minimal inference overhead.
 
         Phase 1 — algebraic fusions:
-            - RepDW multi-branch → single DW Conv2d
+            - DW multi-branch → single DW Conv2d
             - BatchNorm → absorbed into Conv2d weights
             - LayerScale gamma → absorbed into last PW Conv2d
 
         Phase 2 — flatten module tree:
             - Extract raw Conv2d from all container modules
-            - Delete containers (RepDWConv, SEB, Sequential, Conv wrappers)
+            - Delete containers (SEB, Sequential, Conv wrappers)
             - Inline activations as F.hardsigmoid / F.relu / F.hardswish
-            - Result: StarBottleneck holds only 6 Conv2d children (vs 21 before)
+            - Result: StarBottleneck holds only flat Conv2d children
         """
         if hasattr(self, "dw_conv"):
             return  # already flattened
 
         # --- Phase 1: algebraic fusions ---
-        if hasattr(self.dw, "fuse"):
-            self.dw.fuse()
+        dw_conv = self._fuse_dw()
 
         for m in self.pw:
             if isinstance(m, Conv) and hasattr(m, "bn"):
@@ -1452,8 +1416,6 @@ class StarBottleneck(nn.Module):
         self.fuse_layer_scale()
 
         # --- Phase 2: flatten module tree ---
-        # Extract raw Conv2d from containers (local refs keep them alive)
-        dw_conv = self.dw.conv
         pw1 = self.pw[0].conv
         pw2 = self.pw[1].conv
 
@@ -1463,7 +1425,6 @@ class StarBottleneck(nn.Module):
             se_fc2 = self.se.fc[2]
 
         # Delete all container modules
-        del self.dw
         del self.pw
         del self.se
         if self.use_star and self.star_gate is not None:
@@ -1492,7 +1453,7 @@ class C2fStar(C2f):
     Key features configurable from YAML:
         - use_star: Star-style multiplicative fusion for cross-channel spatial mixing (default True).
         - uib_e: PW expansion ratio (default 2.0) — controls capacity vs. cost.
-        - dw_k: RepDWConv max kernel size (default 7) — larger = more spatial context.
+        - dw_k: DW max kernel size (default 7) — larger = more spatial context.
         - se_r: SE reduction ratio (default 4, 0 to disable) — cross-channel recalibration.
         - attn: append PSABlock after each StarBottleneck for global self-attention.
 
@@ -1511,7 +1472,7 @@ class C2fStar(C2f):
             attn (bool): Whether to append PSABlock after each StarBottleneck.
             shortcut (bool): Whether to use shortcut connections.
             uib_e (float): Expansion ratio for StarBottleneck pointwise layers.
-            dw_k (int): Maximum kernel size for RepDWConv in StarBottleneck.
+            dw_k (int): Maximum kernel size for depthwise convolution in StarBottleneck.
             se_r (int): SE reduction ratio for StarBottleneck (0 to disable).
             use_star (bool): Whether to use star-style multiplicative fusion.
         """

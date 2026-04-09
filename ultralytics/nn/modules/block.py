@@ -3,6 +3,8 @@
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1223,22 +1225,16 @@ class SEB(nn.Module):
 
 
 class StarBottleneck(nn.Module):
-    """Star Bottleneck with star-style multiplicative fusion, SE, and Layer Scale.
+    """Star-style inverted bottleneck with RepDW, multiplicative gating, ECA, and layer scale.
 
-    Architecture:
-        x -> RepDW kxk (spatial) -----------+
-                                            * -> SE -> PW expand (Hardswish) -> PW project (linear) -> gamma*out + residual
-        x -> 1x1 star projection + gate ----+
+    RepDW kxk ──┐
+                * ── ECA ── PW-expand (Hardswish) ── PW-project ── gamma*out + residual
+    1x1 star ───┘
 
     Notes:
-        - The DW path uses reparameterizable multi-branch depthwise convolution
-          (branches 3, 5, …, k) plus a BN identity branch.  All branches fuse into
-          a single DW kxk conv at inference.
-        - The star branch produces a bounded channel-mixing gate from the input.
-        - Element-wise multiplication injects cross-channel conditioning into the spatial path.
-        - SE optionally recalibrates channels after the multiplicative fusion.
-        - At inference, gamma is absorbed into the last pointwise conv.
-        - The star branch itself remains explicit at inference.
+        - All DW branches + BN-identity fuse into a single DW conv at inference.
+        - Gamma is absorbed into the last PW conv.
+        - The star branch and ECA remain explicit at inference.
     """
 
     def __init__(
@@ -1248,29 +1244,33 @@ class StarBottleneck(nn.Module):
         shortcut: bool = True,
         e: float = 2.0,
         dw_k: int = 7,
-        se_r: int = 4,
+        use_eca: bool = True,
         use_star: bool = True,
     ):
-        """Initialize StarBottleneck module.
+        """Initialize StarBottleneck.
 
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
-            shortcut (bool): Whether to use residual connection when c1 == c2.
-            e (float): Expansion ratio for the pointwise hidden channels.
-            dw_k (int): Maximum kernel size for depthwise convolution (must be odd, ≥ 3).
-            se_r (int): SE reduction ratio. Set to 0 to disable SE.
-            use_star (bool): Whether to use star-style multiplicative fusion.
+            shortcut (bool): Use residual when c1 == c2.
+            e (float): PW expansion ratio.
+            dw_k (int): Max DW kernel size (odd, >= 3).
+            use_eca (bool): Enable ECA channel attention.
+            use_star (bool): Enable star multiplicative gating.
         """
         super().__init__()
-        c_ = max(1, int(c2 * e))
+        assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
+        assert e > 0, f"e must be > 0, got {e}"
 
-        # DW multi-branch: parallel DW convs (3, 5, …, k) + BN identity
+        c_ = max(1, int(c2 * e))
         self.dw_k = dw_k
+
+        # Reparameterizable depthwise branches
         for ks in range(3, dw_k + 1, 2):
             setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=c1, act=False))
         self.dw_bn_id = nn.BatchNorm2d(c1)
 
+        # Star-style multiplicative gate
         self.use_star = use_star
         if use_star:
             self.star_proj = nn.Conv2d(c1, c1, kernel_size=1, bias=True)
@@ -1279,8 +1279,16 @@ class StarBottleneck(nn.Module):
             self.star_proj = None
             self.star_gate = None
 
-        self.se = SEB(c1, r=se_r) if se_r > 0 else nn.Identity()
+        # ECA channel attention
+        self.use_eca = use_eca
+        if use_eca:
+            t = int(abs(math.log2(c1) / 2 + 0.5))
+            eca_k = max(t if t % 2 else t + 1, 3)
+            self.eca_conv = nn.Conv1d(1, 1, kernel_size=eca_k, padding=eca_k // 2, bias=False)
+        else:
+            self.eca_conv = None
 
+        # Pointwise head
         self.pw = nn.Sequential(
             Conv(c1, c_, 1, 1, act=nn.Hardswish()),
             Conv(c_, c2, 1, 1, act=False),
@@ -1290,44 +1298,53 @@ class StarBottleneck(nn.Module):
         self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
 
     def _mix(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply DW path, optional star-style multiplicative fusion, and SE."""
+        """Apply DW branches, optional star gate, and optional ECA."""
         out = self.dw_bn_id(x)
         for ks in range(3, self.dw_k + 1, 2):
             out = out + getattr(self, f"dw_conv{ks}")(x)
+
         if self.use_star:
             gate = self.star_gate(self.star_proj(x))
             out = out * gate
-        return self.se(out)
+
+        if self.use_eca:
+            s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
+            s = F.hardsigmoid(self.eca_conv(s))
+            out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
+
+        return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass with optional star fusion, SE, layer scale, and residual."""
+        """Forward pass through StarBottleneck."""
         out = self.pw(self._mix(x))
         if self.add:
             return x + out * self.gamma.view(1, -1, 1, 1)
         return out
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass after layer scale has been absorbed into the last conv."""
+        """Forward pass after gamma has been absorbed into the last PW conv."""
         out = self.pw(self._mix(x))
         return x + out if self.add else out
 
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
-        """Minimal inference forward with flat Conv2d modules and functional activations."""
+        """Fused inference forward using flat Conv2d/Conv1d ops."""
         out = self.dw_conv(x)
+
         if self.use_star:
             out = out * F.hardsigmoid(self.star_proj(x))
-        if self._has_se:
-            s = F.adaptive_avg_pool2d(out, 1)
-            s = F.relu(self.se_fc1(s))
-            s = F.hardsigmoid(self.se_fc2(s))
-            out = out * s
+
+        if self.use_eca:
+            s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
+            s = F.hardsigmoid(self.eca_conv(s))
+            out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
+
         out = F.hardswish(self.pw1(out))
         out = self.pw2(out)
         return x + out if self.add else out
 
     @torch.no_grad()
     def fuse_layer_scale(self):
-        """Absorb layer scale gamma into the last pointwise convolution."""
+        """Absorb gamma into the last PW conv."""
         if self.gamma is None:
             return
 
@@ -1345,13 +1362,11 @@ class StarBottleneck(nn.Module):
 
         delattr(self, "gamma")
         self.gamma = None
-        self.forward = self.forward_fuse
 
     @torch.no_grad()
     def _fuse_dw(self):
-        """Fuse all DW branches + identity into a single DW kxk convolution."""
+        """Fuse DW branches + BN-identity into one DW kxk conv."""
         k = self.dw_k
-        assert k >= 3 and k % 2 == 1, f"k must be odd and >= 3, got {k}"
         center = k // 2
 
         bn = self.dw_bn_id
@@ -1388,23 +1403,10 @@ class StarBottleneck(nn.Module):
 
     @torch.no_grad()
     def fuse(self):
-        """Fuse all sub-modules into flat Conv2d layers for minimal inference overhead.
-
-        Phase 1 — algebraic fusions:
-            - DW multi-branch → single DW Conv2d
-            - BatchNorm → absorbed into Conv2d weights
-            - LayerScale gamma → absorbed into last PW Conv2d
-
-        Phase 2 — flatten module tree:
-            - Extract raw Conv2d from all container modules
-            - Delete containers (SEB, Sequential, Conv wrappers)
-            - Inline activations as F.hardsigmoid / F.relu / F.hardswish
-            - Result: StarBottleneck holds only flat Conv2d children
-        """
+        """Fuse DW branches, PW BNs, and layer scale for flat inference."""
         if hasattr(self, "dw_conv"):
-            return  # already flattened
+            return  # already fused
 
-        # --- Phase 1: algebraic fusions ---
         dw_conv = self._fuse_dw()
 
         for m in self.pw:
@@ -1415,75 +1417,53 @@ class StarBottleneck(nn.Module):
 
         self.fuse_layer_scale()
 
-        # --- Phase 2: flatten module tree ---
         pw1 = self.pw[0].conv
         pw2 = self.pw[1].conv
 
-        has_se = isinstance(self.se, SEB)
-        if has_se:
-            se_fc1 = self.se.fc[0]
-            se_fc2 = self.se.fc[2]
-
-        # Delete all container modules
         del self.pw
-        del self.se
         if self.use_star and self.star_gate is not None:
             del self.star_gate
 
-        # Register flat Conv2d as direct children
         self.dw_conv = dw_conv
         self.pw1 = pw1
         self.pw2 = pw2
-        self._has_se = has_se
-        if has_se:
-            self.se_fc1 = se_fc1
-            self.se_fc2 = se_fc2
 
         self.forward = self._forward_flat
 
 
 class C2fStar(C2f):
-    """C2f module with StarBottleneck blocks featuring star-style fusion, SE, and optional PSA.
+    """C2f with StarBottleneck blocks and optional PSA.
 
-    Each StarBottleneck follows the star + inverted bottleneck pattern:
-        x -> RepDW kxk (spatial) -----------+
-                                            * -> SE -> PW expand -> PW project -> LayerScale + residual
-        x -> 1x1 star projection + gate ----+
-
-    Key features configurable from YAML:
-        - use_star: Star-style multiplicative fusion for cross-channel spatial mixing (default True).
-        - uib_e: PW expansion ratio (default 2.0) — controls capacity vs. cost.
-        - dw_k: DW max kernel size (default 7) — larger = more spatial context.
-        - se_r: SE reduction ratio (default 4, 0 to disable) — cross-channel recalibration.
-        - attn: append PSABlock after each StarBottleneck for global self-attention.
-
-    At inference all RepDW branches fuse into a single DW kxk conv and LayerScale gamma
-    is absorbed into the last PW conv. The star branch remains explicit.
+    1×1 ── split ─┬─ StarBottleneck₁ ─ … ─ StarBottleneckₙ [─ PSABlock] ─┐
+                  └──────────────────────────────────────────────────────────┤ concat ── 1×1
+                                                                            │
+    When *attn=True* each StarBottleneck is followed by a PSABlock
+    for position-sensitive self-attention.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, se_r: int = 4, use_star: bool = True):
-        """Initialize C2fStar module.
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, use_eca: bool = True, use_star: bool = True):
+        """Initialize C2fStar.
 
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
-            n (int): Number of StarBottleneck blocks.
-            e (float): Expansion ratio for C2f split channels.
-            attn (bool): Whether to append PSABlock after each StarBottleneck.
-            shortcut (bool): Whether to use shortcut connections.
-            uib_e (float): Expansion ratio for StarBottleneck pointwise layers.
-            dw_k (int): Maximum kernel size for depthwise convolution in StarBottleneck.
-            se_r (int): SE reduction ratio for StarBottleneck (0 to disable).
-            use_star (bool): Whether to use star-style multiplicative fusion.
+            n (int): Number of StarBottleneck repeats.
+            e (float): C2f split-channel ratio.
+            attn (bool): Append PSABlock after each StarBottleneck.
+            shortcut (bool): Residual connection inside each StarBottleneck.
+            uib_e (float): PW expansion ratio forwarded to StarBottleneck.
+            dw_k (int): Max DW kernel size forwarded to StarBottleneck.
+            use_eca (bool): ECA channel attention in StarBottleneck.
+            use_star (bool): Star multiplicative gating in StarBottleneck.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(
             nn.Sequential(
-                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star),
+                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, use_eca=use_eca, use_star=use_star),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star)
+            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, use_eca=use_eca, use_star=use_star)
             for _ in range(n)
         )
 

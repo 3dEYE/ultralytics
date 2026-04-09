@@ -37,7 +37,7 @@ __all__ = (
     "C2fPSA",
     "C3Ghost",
     "C3k2",
-    "C2fUIB",
+    "C2fStar",
     "C2PSAMQ",
     "C3x",
     "CBFuse",
@@ -53,7 +53,7 @@ __all__ = (
     "PSABlockMQ",
     "RepDWConv",
     "SEB",
-    "UIBottleneck",
+    "StarBottleneck",
     "RepNCSPELAN4",
     "RepVGGDW",
     "ResNetLayer",
@@ -1303,8 +1303,8 @@ class SEB(nn.Module):
         return x * self.fc(self.pool(x))
 
 
-class UIBottleneck(nn.Module):
-    """Universal Inverted Bottleneck with star-style multiplicative fusion, SE, and Layer Scale.
+class StarBottleneck(nn.Module):
+    """Star Bottleneck with star-style multiplicative fusion, SE, and Layer Scale.
 
     Architecture:
         x -> RepDW kxk (spatial) -----------+
@@ -1331,7 +1331,7 @@ class UIBottleneck(nn.Module):
         se_r: int = 4,
         use_star: bool = True,
     ):
-        """Initialize UIBottleneck module.
+        """Initialize StarBottleneck module.
 
         Args:
             c1 (int): Input channels.
@@ -1434,7 +1434,7 @@ class UIBottleneck(nn.Module):
             - Extract raw Conv2d from all container modules
             - Delete containers (RepDWConv, SEB, Sequential, Conv wrappers)
             - Inline activations as F.hardsigmoid / F.relu / F.hardswish
-            - Result: UIBottleneck holds only 6 Conv2d children (vs 21 before)
+            - Result: StarBottleneck holds only 6 Conv2d children (vs 21 before)
         """
         if hasattr(self, "dw_conv"):
             return  # already flattened
@@ -1481,10 +1481,10 @@ class UIBottleneck(nn.Module):
         self.forward = self._forward_flat
 
 
-class C2fUIB(C2f):
-    """C2f module with UIBottleneck blocks featuring star-style fusion, SE, and optional PSA.
+class C2fStar(C2f):
+    """C2f module with StarBottleneck blocks featuring star-style fusion, SE, and optional PSA.
 
-    Each UIBottleneck follows the star + Universal Inverted Bottleneck pattern:
+    Each StarBottleneck follows the star + inverted bottleneck pattern:
         x -> RepDW kxk (spatial) -----------+
                                             * -> SE -> PW expand -> PW project -> LayerScale + residual
         x -> 1x1 star projection + gate ----+
@@ -1494,35 +1494,35 @@ class C2fUIB(C2f):
         - uib_e: PW expansion ratio (default 2.0) — controls capacity vs. cost.
         - dw_k: RepDWConv max kernel size (default 7) — larger = more spatial context.
         - se_r: SE reduction ratio (default 4, 0 to disable) — cross-channel recalibration.
-        - attn: append PSABlock after each UIBottleneck for global self-attention.
+        - attn: append PSABlock after each StarBottleneck for global self-attention.
 
     At inference all RepDW branches fuse into a single DW kxk conv and LayerScale gamma
     is absorbed into the last PW conv. The star branch remains explicit.
     """
 
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, se_r: int = 4, use_star: bool = True):
-        """Initialize C2fUIB module.
+        """Initialize C2fStar module.
 
         Args:
             c1 (int): Input channels.
             c2 (int): Output channels.
-            n (int): Number of UIBottleneck blocks.
+            n (int): Number of StarBottleneck blocks.
             e (float): Expansion ratio for C2f split channels.
-            attn (bool): Whether to append PSABlock after each UIBottleneck.
+            attn (bool): Whether to append PSABlock after each StarBottleneck.
             shortcut (bool): Whether to use shortcut connections.
-            uib_e (float): Expansion ratio for UIBottleneck pointwise layers.
-            dw_k (int): Maximum kernel size for RepDWConv in UIBottleneck.
-            se_r (int): SE reduction ratio for UIBottleneck (0 to disable).
+            uib_e (float): Expansion ratio for StarBottleneck pointwise layers.
+            dw_k (int): Maximum kernel size for RepDWConv in StarBottleneck.
+            se_r (int): SE reduction ratio for StarBottleneck (0 to disable).
             use_star (bool): Whether to use star-style multiplicative fusion.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(
             nn.Sequential(
-                UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star),
+                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else UIBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star)
+            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, se_r=se_r, use_star=use_star)
             for _ in range(n)
         )
 

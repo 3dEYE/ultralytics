@@ -1279,14 +1279,17 @@ class StarBottleneck(nn.Module):
             self.star_proj = None
             self.star_gate = None
 
-        # ECA channel attention
+        # ECA channel attention (1D param keeps weight out of Muon's ndim>=2 path)
         self.use_eca = use_eca
         if use_eca:
             t = int(abs(math.log2(c1) / 2 + 0.5))
             eca_k = max(t if t % 2 else t + 1, 3)
-            self.eca_conv = nn.Conv1d(1, 1, kernel_size=eca_k, padding=eca_k // 2, bias=False)
+            self.eca_weight = nn.Parameter(torch.empty(eca_k))
+            nn.init.kaiming_uniform_(self.eca_weight.view(1, 1, -1), a=math.sqrt(5))
+            self.eca_pad = eca_k // 2
         else:
-            self.eca_conv = None
+            self.eca_weight = None
+            self.eca_pad = 0
 
         # Pointwise head
         self.pw = nn.Sequential(
@@ -1309,7 +1312,7 @@ class StarBottleneck(nn.Module):
 
         if self.use_eca:
             s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
-            s = F.hardsigmoid(self.eca_conv(s))
+            s = F.hardsigmoid(F.conv1d(s, self.eca_weight.view(1, 1, -1), padding=self.eca_pad))
             out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
 
         return out
@@ -1335,7 +1338,7 @@ class StarBottleneck(nn.Module):
 
         if self.use_eca:
             s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
-            s = F.hardsigmoid(self.eca_conv(s))
+            s = F.hardsigmoid(F.conv1d(s, self.eca_weight.view(1, 1, -1), padding=self.eca_pad))
             out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
 
         out = F.hardswish(self.pw1(out))

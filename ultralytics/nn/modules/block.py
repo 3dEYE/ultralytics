@@ -1298,7 +1298,7 @@ class StarBottleneck(nn.Module):
         )
 
         self.add = shortcut and c1 == c2
-        self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
+        self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if (self.add and use_star) else None
 
     def _mix(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DW branches, optional star gate, and optional ECA."""
@@ -1321,7 +1321,7 @@ class StarBottleneck(nn.Module):
         """Forward pass through StarBottleneck."""
         out = self.pw(self._mix(x))
         if self.add:
-            return x + out * self.gamma.view(1, -1, 1, 1)
+            return x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
         return out
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:

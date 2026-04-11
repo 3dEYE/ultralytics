@@ -1891,8 +1891,8 @@ class LinearAttention(nn.Module):
         kv = k @ v.transpose(-2, -1)
         out = q.transpose(-2, -1) @ kv
 
-        # Normalize by sum of attention weights
-        denom = q.transpose(-2, -1) @ k.sum(dim=-1, keepdim=True) + 1e-6
+        # Normalize by sum of attention weights (clamp for fp16 stability)
+        denom = (q.transpose(-2, -1) @ k.sum(dim=-1, keepdim=True)).clamp(min=1e-4)
         out = (out / denom).transpose(-2, -1).reshape(B, C, H, W)
 
         # Positional encoding via DW conv on V

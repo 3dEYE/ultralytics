@@ -21,6 +21,7 @@ from .block import (
     C1,
     C2,
     C2PSA,
+    C2LA,
     C2PSAMQ,
     C3,
     C3TR,

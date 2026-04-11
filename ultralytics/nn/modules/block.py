@@ -41,6 +41,9 @@ __all__ = (
     "C3k2",
     "C2fStar",
     "C2PSAMQ",
+    "C2LA",
+    "LinearAttention",
+    "LABlock",
     "C3x",
     "CBFuse",
     "CBLinear",
@@ -1435,13 +1438,13 @@ class StarBottleneck(nn.Module):
 
 
 class C2fStar(C2f):
-    """C2f with StarBottleneck blocks and optional PSA.
+    """C2f with StarBottleneck blocks and optional linear attention.
 
-    1×1 ── split ─┬─ StarBottleneck₁ ─ … ─ StarBottleneckₙ [─ PSABlock] ─┐
-                  └──────────────────────────────────────────────────────────┤ concat ── 1×1
-                                                                            │
-    When *attn=True* each StarBottleneck is followed by a PSABlock
-    for position-sensitive self-attention.
+    1×1 ── split ─┬─ StarBottleneck₁ ─ … ─ StarBottleneckₙ [─ LABlock] ─┐
+                  └─────────────────────────────────────────────────────────┤ concat ── 1×1
+                                                                          │
+    When *attn=True* each StarBottleneck is followed by a LABlock
+    for linear attention (INT8-friendly, no softmax).
     """
 
     def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, use_eca: bool = True, use_star: bool = True):
@@ -1452,7 +1455,7 @@ class C2fStar(C2f):
             c2 (int): Output channels.
             n (int): Number of StarBottleneck repeats.
             e (float): C2f split-channel ratio.
-            attn (bool): Append PSABlock after each StarBottleneck.
+            attn (bool): Append LABlock after each StarBottleneck.
             shortcut (bool): Residual connection inside each StarBottleneck.
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
@@ -1463,7 +1466,7 @@ class C2fStar(C2f):
         self.m = nn.ModuleList(
             nn.Sequential(
                 StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, use_eca=use_eca, use_star=use_star),
-                PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
+                LABlock(self.c, attn_ratio=0.5, num_heads=C2LA._pick_num_heads(self.c)),
             )
             if attn
             else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, use_eca=use_eca, use_star=use_star)
@@ -1830,6 +1833,139 @@ class C2PSA(nn.Module):
         a, b = self.cv1(x).split((self.c, self.c), dim=1)
         b = self.m(b)
         return self.cv2(torch.cat((a, b), 1))
+
+
+class LinearAttention(nn.Module):
+    """Linear attention with ReLU kernel — O(N) complexity, INT8-quantization friendly.
+
+    Replaces softmax(QK^T)V with φ(Q)(φ(K)^T V) where φ = ReLU, eliminating
+    the O(N²) attention matrix and the softmax operation entirely.
+    A depthwise convolution provides local spatial context.
+    """
+
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
+        """Initialize LinearAttention module.
+
+        Args:
+            dim (int): Input dimension.
+            num_heads (int): Number of attention heads.
+            attn_ratio (float): Attention ratio for key dimension.
+        """
+        super().__init__()
+        assert dim % num_heads == 0, "dim must be divisible by num_heads"
+
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.key_dim = int(self.head_dim * attn_ratio)
+        assert self.key_dim > 0, "key_dim must be > 0"
+
+        nh_kd = self.key_dim * num_heads
+        h = dim + 2 * nh_kd
+
+        self.qkv = Conv(dim, h, 1, act=False)
+        self.proj = Conv(dim, dim, 1, act=False)
+        self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass — linear attention with ReLU kernel and DW positional encoding.
+
+        Args:
+            x (torch.Tensor): Input tensor of shape (B, C, H, W).
+
+        Returns:
+            (torch.Tensor): Output tensor of the same shape.
+        """
+        B, C, H, W = x.shape
+        N = H * W
+
+        qkv = self.qkv(x)
+        q, k, v = qkv.reshape(B, self.num_heads, 2 * self.key_dim + self.head_dim, N).split(
+            [self.key_dim, self.key_dim, self.head_dim], dim=2
+        )
+
+        # ReLU kernel replaces softmax — piecewise-linear, INT8-safe
+        q = F.relu(q)
+        k = F.relu(k)
+
+        # Associative trick: Q(K^T V) instead of (QK^T)V → O(Nd²) vs O(N²d)
+        kv = k @ v.transpose(-2, -1)
+        out = q.transpose(-2, -1) @ kv
+
+        # Normalize by sum of attention weights
+        denom = q.transpose(-2, -1) @ k.sum(dim=-1, keepdim=True) + 1e-6
+        out = (out / denom).transpose(-2, -1).reshape(B, C, H, W)
+
+        # Positional encoding via DW conv on V
+        v_img = v.reshape(B, self.num_heads, self.head_dim, H, W).reshape(B, C, H, W)
+        out = out + self.pe(v_img)
+
+        return self.proj(out)
+
+
+class LABlock(nn.Module):
+    """Linear Attention block — drop-in replacement for PSABlock, INT8-friendly, no softmax."""
+
+    def __init__(self, c: int, attn_ratio: float = 0.5, num_heads: int = 4, shortcut: bool = True) -> None:
+        """Initialize LABlock.
+
+        Args:
+            c (int): Input and output channels.
+            attn_ratio (float): Attention ratio for key dimension.
+            num_heads (int): Number of attention heads.
+            shortcut (bool): Whether to use shortcut connections.
+        """
+        super().__init__()
+        self.attn = LinearAttention(c, attn_ratio=attn_ratio, num_heads=num_heads)
+        self.ffn = nn.Sequential(
+            Conv(c, c * 2, 1),
+            Conv(c * 2, c, 1, act=False),
+        )
+        self.add = shortcut
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through LABlock."""
+        x = x + self.attn(x) if self.add else self.attn(x)
+        x = x + self.ffn(x) if self.add else self.ffn(x)
+        return x
+
+
+class C2LA(nn.Module):
+    """C2 with LinearAttention — drop-in replacement for C2PSA, INT8-friendly, O(N)."""
+
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5):
+        """Initialize C2LA module.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of LABlock modules.
+            e (float): Expansion ratio.
+        """
+        super().__init__()
+        assert c1 == c2, "C2LA requires c1 == c2"
+        self.c = int(c1 * e)
+        assert self.c > 0, "hidden channels must be > 0"
+
+        heads = self._pick_num_heads(self.c)
+
+        self.cv1 = Conv(c1, 2 * self.c, 1, 1)
+        self.cv2 = Conv(2 * self.c, c2, 1)
+        self.m = nn.Sequential(*(LABlock(self.c, attn_ratio=0.5, num_heads=heads) for _ in range(n)))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass through C2LA module."""
+        a, b = self.cv1(x).split((self.c, self.c), dim=1)
+        b = self.m(b)
+        return self.cv2(torch.cat((a, b), 1))
+
+    @staticmethod
+    def _pick_num_heads(c: int) -> int:
+        """Pick a valid num_heads that divides c."""
+        if c % 4 == 0:
+            return 4
+        if c % 2 == 0:
+            return 2
+        return 1
 
 
 class PSABlockMQ(PSABlock):

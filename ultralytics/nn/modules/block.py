@@ -1887,18 +1887,22 @@ class LinearAttention(nn.Module):
         q = F.relu(q)
         k = F.relu(k)
 
+        # Positional encoding uses original-precision V
+        v_pe = v.reshape(B, C, H, W)
+
+        # Matmuls in fp32 to prevent fp16 overflow at large spatial resolutions (P3: N=6400)
+        dt = q.dtype
+        q, k, v = q.float(), k.float(), v.float()
+
         # Associative trick: Q(K^T V) instead of (QK^T)V → O(Nd²) vs O(N²d)
         kv = k @ v.transpose(-2, -1)
         out = q.transpose(-2, -1) @ kv
 
-        # Normalize by sum of attention weights (clamp for fp16 stability)
-        denom = (q.transpose(-2, -1) @ k.sum(dim=-1, keepdim=True)).clamp(min=1e-4)
-        out = (out / denom).transpose(-2, -1).reshape(B, C, H, W)
+        # Normalize by sum of attention weights
+        denom = (q.transpose(-2, -1) @ k.sum(dim=-1, keepdim=True)).clamp(min=1e-6)
+        out = (out / denom).transpose(-2, -1).reshape(B, C, H, W).to(dt)
 
-        # Positional encoding via DW conv on V
-        v_img = v.reshape(B, self.num_heads, self.head_dim, H, W).reshape(B, C, H, W)
-        out = out + self.pe(v_img)
-
+        out = out + self.pe(v_pe)
         return self.proj(out)
 
 

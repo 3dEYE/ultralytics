@@ -1322,10 +1322,14 @@ class StarBottleneck(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through StarBottleneck."""
-        out = self.pw(self._mix(x))
-        if self.add:
-            return x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
-        return out
+        dt = x.dtype
+        if torch.is_autocast_enabled():
+            x = x.float()
+        with torch.amp.autocast("cuda", enabled=False):
+            out = self.pw(self._mix(x))
+            if self.add:
+                out = x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
+        return out.to(dt)
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass after gamma has been absorbed into the last PW conv."""
@@ -1836,28 +1840,28 @@ class C2PSA(nn.Module):
 
 
 class LinearAttention(nn.Module):
-    """Linear attention with ReLU kernel — O(N) complexity, INT8-quantization friendly.
+    """Linear attention with ReLU kernel — O(N) complexity, INT8-quantization friendly."""
 
-    Replaces softmax(QK^T)V with φ(Q)(φ(K)^T V) where φ = ReLU, eliminating
-    the O(N²) attention matrix and the softmax operation entirely.
-    A depthwise convolution provides local spatial context.
-    """
-
-    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5):
+    def __init__(self, dim: int, num_heads: int = 8, attn_ratio: float = 0.5, eps: float = 1e-4):
         """Initialize LinearAttention module.
 
         Args:
             dim (int): Input dimension.
             num_heads (int): Number of attention heads.
             attn_ratio (float): Attention ratio for key dimension.
+            eps (float): Epsilon for numerical stability in normalization.
         """
         super().__init__()
+        assert dim > 0, "dim must be > 0"
+        assert num_heads > 0, "num_heads must be > 0"
         assert dim % num_heads == 0, "dim must be divisible by num_heads"
+        assert attn_ratio > 0, "attn_ratio must be > 0"
+        assert eps > 0, "eps must be > 0"
 
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
-        self.key_dim = int(self.head_dim * attn_ratio)
-        assert self.key_dim > 0, "key_dim must be > 0"
+        self.key_dim = max(1, int(self.head_dim * attn_ratio))
+        self.eps = eps
 
         nh_kd = self.key_dim * num_heads
         h = dim + 2 * nh_kd
@@ -1865,6 +1869,10 @@ class LinearAttention(nn.Module):
         self.qkv = Conv(dim, h, 1, act=False)
         self.proj = Conv(dim, dim, 1, act=False)
         self.pe = Conv(dim, dim, 3, 1, g=dim, act=False)
+
+        if hasattr(self.proj, "bn"):
+            nn.init.zeros_(self.proj.bn.weight)
+            nn.init.zeros_(self.proj.bn.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass — linear attention with ReLU kernel and DW positional encoding.
@@ -1877,33 +1885,29 @@ class LinearAttention(nn.Module):
         """
         B, C, H, W = x.shape
         N = H * W
+        dt = x.dtype
+        if torch.is_autocast_enabled():
+            x = x.float()
+        with torch.amp.autocast("cuda", enabled=False):
+            qkv = self.qkv(x)
+            q, k, v = qkv.reshape(B, self.num_heads, 2 * self.key_dim + self.head_dim, N).split(
+                [self.key_dim, self.key_dim, self.head_dim], dim=2
+            )
 
-        qkv = self.qkv(x)
-        q, k, v = qkv.reshape(B, self.num_heads, 2 * self.key_dim + self.head_dim, N).split(
-            [self.key_dim, self.key_dim, self.head_dim], dim=2
-        )
+            q = F.relu(q)
+            k = F.relu(k)
 
-        # ReLU kernel replaces softmax — piecewise-linear, INT8-safe
-        q = F.relu(q)
-        k = F.relu(k)
+            v_pe = v.reshape(B, self.num_heads, self.head_dim, H, W).reshape(B, C, H, W)
 
-        # Positional encoding uses original-precision V
-        v_pe = v.reshape(B, C, H, W)
+            kv = k @ v.transpose(-2, -1)
+            out = q.transpose(-2, -1) @ kv
 
-        # Matmuls in fp32 to prevent fp16 overflow at large spatial resolutions (P3: N=6400)
-        dt = q.dtype
-        q, k, v = q.float(), k.float(), v.float()
+            denom = (q.transpose(-2, -1) @ k.sum(dim=-1, keepdim=True)).clamp(min=self.eps)
+            out = (out / denom).transpose(-2, -1).reshape(B, C, H, W)
 
-        # Associative trick: Q(K^T V) instead of (QK^T)V → O(Nd²) vs O(N²d)
-        kv = k @ v.transpose(-2, -1)
-        out = q.transpose(-2, -1) @ kv
-
-        # Normalize by sum of attention weights
-        denom = (q.transpose(-2, -1) @ k.sum(dim=-1, keepdim=True)).clamp(min=1e-6)
-        out = (out / denom).transpose(-2, -1).reshape(B, C, H, W).to(dt)
-
-        out = out + self.pe(v_pe)
-        return self.proj(out)
+            out = out + self.pe(v_pe)
+            out = self.proj(out)
+        return out.to(dt)
 
 
 class LABlock(nn.Module):
@@ -1920,16 +1924,19 @@ class LABlock(nn.Module):
         """
         super().__init__()
         self.attn = LinearAttention(c, attn_ratio=attn_ratio, num_heads=num_heads)
-        self.ffn = nn.Sequential(
-            Conv(c, c * 2, 1),
-            Conv(c * 2, c, 1, act=False),
-        )
+        self.ffn = nn.Sequential(Conv(c, c * 2, 1), Conv(c * 2, c, 1, act=False))
         self.add = shortcut
+        self.gamma_attn = nn.Parameter(1e-5 * torch.ones(1))
+        self.gamma_ffn = nn.Parameter(1e-5 * torch.ones(1))
+        ffn_out = self.ffn[-1]
+        if hasattr(ffn_out, "bn"):
+            nn.init.zeros_(ffn_out.bn.weight)
+            nn.init.zeros_(ffn_out.bn.bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through LABlock."""
-        x = x + self.attn(x) if self.add else self.attn(x)
-        x = x + self.ffn(x) if self.add else self.ffn(x)
+        x = x + self.gamma_attn * self.attn(x) if self.add else self.attn(x)
+        x = x + self.gamma_ffn * self.ffn(x) if self.add else self.ffn(x)
         return x
 
 

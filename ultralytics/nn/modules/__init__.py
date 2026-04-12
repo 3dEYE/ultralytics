@@ -54,6 +54,7 @@ from .block import (
     HGBlock,
     HGStem,
     ImagePoolingAttn,
+    LABlock,
     MaxSigmoidAttnBlock,
     MQAttention,
     PSABlockMQ,

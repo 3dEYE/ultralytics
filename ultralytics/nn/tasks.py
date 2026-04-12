@@ -40,6 +40,7 @@ from ultralytics.nn.modules import (
     C3k2,
     C2fStar,
     C3x,
+    LABlock,
     CBFuse,
     CBLinear,
     Classify,
@@ -254,6 +255,8 @@ class BaseModel(torch.nn.Module):
                     m.forward = m.forward_fuse
                 if isinstance(m, StarBottleneck):
                     m.fuse()
+                if isinstance(m, LABlock):
+                    m.fuse_gamma()
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
             self.info(verbose=verbose)

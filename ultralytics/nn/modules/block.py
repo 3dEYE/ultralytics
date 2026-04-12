@@ -1227,6 +1227,31 @@ class SEB(nn.Module):
         return x * self.fc(self.pool(x))
 
 
+class ECAConv(nn.Module):
+    """ECA channel-attention conv with 1-D weight — Muon-safe and INT8-traceable.
+
+    The weight is stored as a 1-D ``nn.Parameter`` (ndim=1) so that MuSGD skips it
+    (Muon only processes params with ndim >= 2). Wrapping in ``nn.Module`` gives
+    INT8 quantization frameworks a proper module boundary for observer insertion.
+    """
+
+    def __init__(self, kernel_size: int, padding: int):
+        """Initialize ECAConv.
+
+        Args:
+            kernel_size (int): 1-D convolution kernel size.
+            padding (int): Symmetric padding.
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(kernel_size))
+        self.padding = padding
+        nn.init.kaiming_uniform_(self.weight.view(1, 1, -1), a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply 1-D convolution using the stored weight."""
+        return F.conv1d(x, self.weight.view(1, 1, -1), padding=self.padding)
+
+
 class StarBottleneck(nn.Module):
     """Star-style inverted bottleneck with RepDW, multiplicative gating, ECA, and layer scale.
 
@@ -1282,17 +1307,15 @@ class StarBottleneck(nn.Module):
             self.star_proj = None
             self.star_gate = None
 
-        # ECA channel attention (1D param keeps weight out of Muon's ndim>=2 path)
+        # ECA channel attention (1D weight stays out of Muon's ndim>=2 path;
+        # ECAConv module gives INT8 quantizers a proper traceable boundary)
         self.use_eca = use_eca
         if use_eca:
             t = int(abs(math.log2(c1) / 2 + 0.5))
             eca_k = max(t if t % 2 else t + 1, 3)
-            self.eca_weight = nn.Parameter(torch.empty(eca_k))
-            nn.init.kaiming_uniform_(self.eca_weight.view(1, 1, -1), a=math.sqrt(5))
-            self.eca_pad = eca_k // 2
+            self.eca_conv = ECAConv(eca_k, eca_k // 2)
         else:
-            self.eca_weight = None
-            self.eca_pad = 0
+            self.eca_conv = None
 
         # Pointwise head
         self.pw = nn.Sequential(
@@ -1315,7 +1338,7 @@ class StarBottleneck(nn.Module):
 
         if self.use_eca:
             s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
-            s = F.hardsigmoid(F.conv1d(s, self.eca_weight.view(1, 1, -1), padding=self.eca_pad))
+            s = F.hardsigmoid(self.eca_conv(s))
             out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
 
         return out
@@ -1343,7 +1366,7 @@ class StarBottleneck(nn.Module):
 
         if self.use_eca:
             s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
-            s = F.hardsigmoid(F.conv1d(s, self.eca_weight.view(1, 1, -1), padding=self.eca_pad))
+            s = F.hardsigmoid(self.eca_conv(s))
             out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
 
         out = F.hardswish(self.pw1(out))
@@ -1933,9 +1956,46 @@ class LABlock(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through LABlock."""
-        x = x + self.gamma_attn * self.attn(x) if self.add else self.attn(x)
-        x = x + self.gamma_ffn * self.ffn(x) if self.add else self.ffn(x)
+        if self.gamma_attn is not None:
+            x = x + self.gamma_attn * self.attn(x) if self.add else self.attn(x)
+            x = x + self.gamma_ffn * self.ffn(x) if self.add else self.ffn(x)
+        else:
+            x = x + self.attn(x) if self.add else self.attn(x)
+            x = x + self.ffn(x) if self.add else self.ffn(x)
         return x
+
+    @torch.no_grad()
+    def fuse_gamma(self):
+        """Absorb gamma scalars into output convolutions for INT8-friendly inference."""
+        if self.gamma_attn is None:
+            return  # already fused
+
+        # gamma_attn → attn.proj
+        g_a = self.gamma_attn.data.item()
+        proj = self.attn.proj
+        if hasattr(proj, "bn"):
+            proj.conv = fuse_conv_and_bn(proj.conv, proj.bn)
+            delattr(proj, "bn")
+            proj.forward = proj.forward_fuse
+        proj.conv.weight.data *= g_a
+        if proj.conv.bias is not None:
+            proj.conv.bias.data *= g_a
+
+        # gamma_ffn → ffn[-1]
+        g_f = self.gamma_ffn.data.item()
+        last = self.ffn[-1]
+        if hasattr(last, "bn"):
+            last.conv = fuse_conv_and_bn(last.conv, last.bn)
+            delattr(last, "bn")
+            last.forward = last.forward_fuse
+        last.conv.weight.data *= g_f
+        if last.conv.bias is not None:
+            last.conv.bias.data *= g_f
+
+        delattr(self, "gamma_attn")
+        delattr(self, "gamma_ffn")
+        self.gamma_attn = None
+        self.gamma_ffn = None
 
 
 class C2LA(nn.Module):

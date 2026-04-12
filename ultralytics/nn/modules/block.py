@@ -1323,18 +1323,16 @@ class StarBottleneck(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through StarBottleneck."""
         dt = x.dtype
+        # _mix has stacked multiplicative ops (star × ECA × DW) whose gradients
+        # overflow fp16 under GradScaler; pw (linear Conv+BN) is safe in autocast.
         if torch.is_autocast_enabled():
             x = x.float()
         with torch.amp.autocast("cuda", enabled=False):
-            out = self.pw(self._mix(x))
-            if self.add:
-                out = x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
+            mixed = self._mix(x)
+        out = self.pw(mixed)
+        if self.add:
+            out = x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
         return out.to(dt)
-
-    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass after gamma has been absorbed into the last PW conv."""
-        out = self.pw(self._mix(x))
-        return x + out if self.add else out
 
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
         """Fused inference forward using flat Conv2d/Conv1d ops."""

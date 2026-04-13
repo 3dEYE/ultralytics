@@ -1317,14 +1317,16 @@ class StarBottleneck(nn.Module):
             out = out + getattr(self, f"dw_conv{ks}")(x)
 
         if self.use_eca:
-            s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
+            s = out.mean((-2, -1)).unsqueeze(1)  # B, 1, C
             s = F.hardsigmoid(self.eca_conv(s))
-            out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
+            out = out * s.transpose(1, 2).unsqueeze(-1)  # B, C, 1, 1
 
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through StarBottleneck."""
+        if hasattr(self, "dw_conv"):
+            return self._forward_flat(x)
         dt = x.dtype
         # _mix has stacked multiplicative ops (ECA × DW) whose gradients
         # overflow fp16 under GradScaler; pw (linear Conv+BN) is safe in autocast.
@@ -1342,9 +1344,9 @@ class StarBottleneck(nn.Module):
         out = self.dw_conv(x)
 
         if self.use_eca:
-            s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
+            s = out.mean((-2, -1)).unsqueeze(1)  # B, 1, C
             s = F.hardsigmoid(self.eca_conv(s))
-            out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
+            out = out * s.transpose(1, 2).unsqueeze(-1)  # B, C, 1, 1
 
         out = F.hardswish(self.pw1(out))
         out = self.pw2(out)
@@ -1425,6 +1427,17 @@ class StarBottleneck(nn.Module):
 
         self.fuse_layer_scale()
 
+        # Convert ECAConv (per-forward .view) to native nn.Conv1d
+        if self.use_eca and self.eca_conv is not None:
+            eca = self.eca_conv
+            k = eca.weight.numel()
+            conv1d = nn.Conv1d(
+                1, 1, k, padding=eca.padding, bias=False,
+                device=eca.weight.device, dtype=eca.weight.dtype,
+            ).requires_grad_(False)
+            conv1d.weight.data.copy_(eca.weight.detach().view(1, 1, -1))
+            self.eca_conv = conv1d
+
         pw1 = self.pw[0].conv
         pw2 = self.pw[1].conv
 
@@ -1433,8 +1446,6 @@ class StarBottleneck(nn.Module):
         self.dw_conv = dw_conv
         self.pw1 = pw1
         self.pw2 = pw2
-
-        self.forward = self._forward_flat
 
 
 class C2fStar(C2f):

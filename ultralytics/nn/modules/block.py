@@ -1224,6 +1224,31 @@ class SEB(nn.Module):
         return x * self.fc(self.pool(x))
 
 
+class ECAConv(nn.Module):
+    """ECA channel-attention conv with 1-D weight — Muon-safe and INT8-traceable.
+
+    The weight is stored as a 1-D ``nn.Parameter`` (ndim=1) so that MuSGD skips it
+    (Muon only processes params with ndim >= 2). Wrapping in ``nn.Module`` gives
+    INT8 quantization frameworks a proper module boundary for observer insertion.
+    """
+
+    def __init__(self, kernel_size: int, padding: int):
+        """Initialize ECAConv.
+
+        Args:
+            kernel_size (int): 1-D convolution kernel size.
+            padding (int): Symmetric padding.
+        """
+        super().__init__()
+        self.weight = nn.Parameter(torch.empty(kernel_size))
+        self.padding = padding
+        nn.init.kaiming_uniform_(self.weight.view(1, 1, -1), a=math.sqrt(5))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply 1-D convolution using the stored weight."""
+        return F.conv1d(x, self.weight.view(1, 1, -1), padding=self.padding)
+
+
 class StarBottleneck(nn.Module):
     """Star-style inverted bottleneck with RepDW, multiplicative gating, ECA, and layer scale.
 
@@ -1279,17 +1304,15 @@ class StarBottleneck(nn.Module):
             self.star_proj = None
             self.star_gate = None
 
-        # ECA channel attention (1D param keeps weight out of Muon's ndim>=2 path)
+        # ECA channel attention (1D weight stays out of Muon's ndim>=2 path;
+        # ECAConv module gives INT8 quantizers a proper traceable boundary)
         self.use_eca = use_eca
         if use_eca:
             t = int(abs(math.log2(c1) / 2 + 0.5))
             eca_k = max(t if t % 2 else t + 1, 3)
-            self.eca_weight = nn.Parameter(torch.empty(eca_k))
-            nn.init.kaiming_uniform_(self.eca_weight.view(1, 1, -1), a=math.sqrt(5))
-            self.eca_pad = eca_k // 2
+            self.eca_conv = ECAConv(eca_k, eca_k // 2)
         else:
-            self.eca_weight = None
-            self.eca_pad = 0
+            self.eca_conv = None
 
         # Pointwise head
         self.pw = nn.Sequential(
@@ -1312,22 +1335,24 @@ class StarBottleneck(nn.Module):
 
         if self.use_eca:
             s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
-            s = F.hardsigmoid(F.conv1d(s, self.eca_weight.view(1, 1, -1), padding=self.eca_pad))
+            s = F.hardsigmoid(self.eca_conv(s))
             out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
 
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through StarBottleneck."""
-        out = self.pw(self._mix(x))
+        dt = x.dtype
+        # _mix has stacked multiplicative ops (star × ECA × DW) whose gradients
+        # overflow fp16 under GradScaler; pw (linear Conv+BN) is safe in autocast.
+        if torch.is_autocast_enabled():
+            x = x.float()
+        with torch.amp.autocast("cuda", enabled=False):
+            mixed = self._mix(x)
+        out = self.pw(mixed)
         if self.add:
-            return x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
-        return out
-
-    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass after gamma has been absorbed into the last PW conv."""
-        out = self.pw(self._mix(x))
-        return x + out if self.add else out
+            out = x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
+        return out.to(dt)
 
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
         """Fused inference forward using flat Conv2d/Conv1d ops."""
@@ -1338,7 +1363,7 @@ class StarBottleneck(nn.Module):
 
         if self.use_eca:
             s = F.adaptive_avg_pool2d(out, 1).squeeze(-1).transpose(-1, -2)  # B, 1, C
-            s = F.hardsigmoid(F.conv1d(s, self.eca_weight.view(1, 1, -1), padding=self.eca_pad))
+            s = F.hardsigmoid(self.eca_conv(s))
             out = out * s.transpose(-1, -2).unsqueeze(-1)  # B, C, 1, 1
 
         out = F.hardswish(self.pw1(out))

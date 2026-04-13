@@ -3,8 +3,6 @@
 
 from __future__ import annotations
 
-import math
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -1224,40 +1222,14 @@ class SEB(nn.Module):
         return x * self.fc(self.pool(x))
 
 
-class ECAConv(nn.Module):
-    """ECA channel-attention conv with 1-D weight — Muon-safe and INT8-traceable.
-
-    The weight is stored as a 1-D ``nn.Parameter`` (ndim=1) so that MuSGD skips it
-    (Muon only processes params with ndim >= 2). Wrapping in ``nn.Module`` gives
-    INT8 quantization frameworks a proper module boundary for observer insertion.
-    """
-
-    def __init__(self, kernel_size: int, padding: int):
-        """Initialize ECAConv.
-
-        Args:
-            kernel_size (int): 1-D convolution kernel size.
-            padding (int): Symmetric padding.
-        """
-        super().__init__()
-        self.weight = nn.Parameter(torch.empty(kernel_size))
-        self.padding = padding
-        nn.init.kaiming_uniform_(self.weight.view(1, 1, -1), a=math.sqrt(5))
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply 1-D convolution using the stored weight."""
-        return F.conv1d(x, self.weight.view(1, 1, -1), padding=self.padding)
-
-
 class StarBottleneck(nn.Module):
-    """Inverted bottleneck with RepDW, ECA, and layer scale.
+    """Inverted bottleneck with RepDW and layer scale.
 
-    RepDW kxk ── ECA ── PW-expand (Hardswish) ── PW-project ── gamma*out + residual
+    RepDW kxk ── PW-expand (Hardswish) ── PW-project ── gamma*out + residual
 
     Notes:
         - All DW branches + BN-identity fuse into a single DW conv at inference.
         - Gamma is absorbed into the last PW conv.
-        - ECA remains explicit at inference.
     """
 
     def __init__(
@@ -1266,8 +1238,7 @@ class StarBottleneck(nn.Module):
         c2: int,
         shortcut: bool = True,
         e: float = 2.0,
-        dw_k: int = 7,
-        use_eca: bool = True,
+        dw_k: int = 7
     ):
         """Initialize StarBottleneck.
 
@@ -1277,7 +1248,6 @@ class StarBottleneck(nn.Module):
             shortcut (bool): Use residual when c1 == c2.
             e (float): PW expansion ratio.
             dw_k (int): Max DW kernel size (odd, >= 3).
-            use_eca (bool): Enable ECA channel attention.
         """
         super().__init__()
         assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
@@ -1291,16 +1261,6 @@ class StarBottleneck(nn.Module):
             setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=c1, act=False))
         self.dw_bn_id = nn.BatchNorm2d(c1)
 
-        # ECA channel attention (1D weight stays out of Muon's ndim>=2 path;
-        # ECAConv module gives INT8 quantizers a proper traceable boundary)
-        self.use_eca = use_eca
-        if use_eca:
-            t = int(abs(math.log2(c1) / 2 + 0.5))
-            eca_k = max(t if t % 2 else t + 1, 3)
-            self.eca_conv = ECAConv(eca_k, eca_k // 2)
-        else:
-            self.eca_conv = None
-
         # Pointwise head
         self.pw = nn.Sequential(
             Conv(c1, c_, 1, 1, act=nn.Hardswish()),
@@ -1311,42 +1271,25 @@ class StarBottleneck(nn.Module):
         self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
 
     def _mix(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply DW branches and optional ECA."""
+        """Apply DW branches."""
         out = self.dw_bn_id(x)
         for ks in range(3, self.dw_k + 1, 2):
             out = out + getattr(self, f"dw_conv{ks}")(x)
-
-        if self.use_eca:
-            s = out.mean((-2, -1)).unsqueeze(1)  # B, 1, C
-            s = F.hardsigmoid(self.eca_conv(s))
-            out = out * s.transpose(1, 2).unsqueeze(-1)  # B, C, 1, 1
-
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through StarBottleneck."""
         if hasattr(self, "dw_conv"):
             return self._forward_flat(x)
-        dt = x.dtype
-        # _mix has stacked multiplicative ops (ECA × DW) whose gradients
-        # overflow fp16 under GradScaler; pw (linear Conv+BN) is safe in autocast.
-        if torch.is_autocast_enabled():
-            x = x.float()
-        with torch.amp.autocast("cuda", enabled=False):
-            mixed = self._mix(x)
+        mixed = self._mix(x)
         out = self.pw(mixed)
         if self.add:
             out = x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
-        return out.to(dt)
+        return out
 
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused inference forward using flat Conv2d/Conv1d ops."""
+        """Fused inference forward using flat Conv2d ops."""
         out = self.dw_conv(x)
-
-        if self.use_eca:
-            s = out.mean((-2, -1)).unsqueeze(1)  # B, 1, C
-            s = F.hardsigmoid(self.eca_conv(s))
-            out = out * s.transpose(1, 2).unsqueeze(-1)  # B, C, 1, 1
 
         out = F.hardswish(self.pw1(out))
         out = self.pw2(out)
@@ -1427,17 +1370,6 @@ class StarBottleneck(nn.Module):
 
         self.fuse_layer_scale()
 
-        # Convert ECAConv (per-forward .view) to native nn.Conv1d
-        if self.use_eca and self.eca_conv is not None:
-            eca = self.eca_conv
-            k = eca.weight.numel()
-            conv1d = nn.Conv1d(
-                1, 1, k, padding=eca.padding, bias=False,
-                device=eca.weight.device, dtype=eca.weight.dtype,
-            ).requires_grad_(False)
-            conv1d.weight.data.copy_(eca.weight.detach().view(1, 1, -1))
-            self.eca_conv = conv1d
-
         pw1 = self.pw[0].conv
         pw2 = self.pw[1].conv
 
@@ -1458,7 +1390,7 @@ class C2fStar(C2f):
     for position-sensitive self-attention.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, use_eca: bool = True):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7):
         """Initialize C2fStar.
 
         Args:
@@ -1470,16 +1402,15 @@ class C2fStar(C2f):
             shortcut (bool): Residual connection inside each StarBottleneck.
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
-            use_eca (bool): ECA channel attention in StarBottleneck.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(
             nn.Sequential(
-                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, use_eca=use_eca),
+                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, use_eca=use_eca)
+            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k)
             for _ in range(n)
         )
 

@@ -1,6 +1,6 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# YOLO19: hard-COCO budget shift from P5 attention into stronger P4 head mixing
+# YOLO20: hard-COCO low-cost head mixing boost
 
 # Parameters
 nc: 80 # number of classes
@@ -43,6 +43,6 @@ head:
 
   - [-1, 1, Conv, [512, 3, 2]]
   - [[-1, 10], 1, Concat, [1]] # cat head P5
-  - [-1, 1, C2fStar, [1024, 0.5, False, True, 2.0, 7]] # 22
+  - [-1, 1, C2fStar, [1024, 0.5, True, True, 2.0, 7]] # 22
 
   - [[16, 19, 22], 1, Detect, [nc]] # Detect(P3, P4, P5)

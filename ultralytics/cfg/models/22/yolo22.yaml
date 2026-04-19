@@ -1,0 +1,50 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO22: yolo17 backbone + SEB channel recalibration after early C2fStar stages
+
+# Parameters
+nc: 80 # number of classes
+end2end: False # NMS post-processing
+reg_max: 1 # DFL bins
+scales: # model compound scaling constants
+  # [depth, width, max_channels]
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C2fStar, [256, 0.25, False, True, 6.0, 5]] # 2
+  - [-1, 1, SEB, [4]] # 3 - channel recalibration after P2
+  - [-1, 1, Conv, [256, 3, 2]] # 4-P3/8
+  - [-1, 2, C2fStar, [512, 0.25, False, True, 4.0, 5]] # 5
+  - [-1, 1, SEB, [4]] # 6 - channel recalibration after P3
+  - [-1, 1, Conv, [512, 3, 2]] # 7-P4/16
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5]] # 8
+  - [-1, 1, Conv, [1024, 3, 2]] # 9-P5/32
+  - [-1, 2, C2fStar, [1024, 0.5, False, True, 2.0, 7]] # 10
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 11
+  - [-1, 2, C2PSA, [1024]] # 12
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 8], 1, Concat, [1]] # cat backbone P4
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5]] # 15
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 5], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, C2fStar, [256, 0.5, False, True, 2.0, 7]] # 18
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 15], 1, Concat, [1]] # cat head P4
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5]] # 21
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 12], 1, Concat, [1]] # cat head P5
+  - [-1, 1, C2fStar, [1024, 0.5, True, True, 2.0, 7]] # 24
+
+  - [[18, 21, 24], 1, Detect, [nc]] # Detect(P3, P4, P5)

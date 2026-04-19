@@ -61,6 +61,7 @@ from ultralytics.nn.modules import (
     Pose26,
     RepC3,
     RepConv,
+    SEB,
     StarBottleneck,
     RepNCSPELAN4,
     RepVGGDW,
@@ -1685,6 +1686,9 @@ def parse_model(d, ch, verbose=True):
                 n = 1
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
+        elif m is SEB:
+            c2 = ch[f]
+            args = [c2, *args]
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:

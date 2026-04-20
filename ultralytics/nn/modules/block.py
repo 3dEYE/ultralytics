@@ -1238,7 +1238,8 @@ class StarBottleneck(nn.Module):
         c2: int,
         shortcut: bool = True,
         e: float = 2.0,
-        dw_k: int = 7
+        dw_k: int = 7,
+        mgs: int = 1,
     ):
         """Initialize StarBottleneck.
 
@@ -1248,17 +1249,24 @@ class StarBottleneck(nn.Module):
             shortcut (bool): Use residual when c1 == c2.
             e (float): PW expansion ratio.
             dw_k (int): Max DW kernel size (odd, >= 3).
+            mgs (int): Min group size for DW conv — channels per group. 1 = pure DW,
+                       4 = each filter sees 4 channels (adds cross-channel spatial mixing at low c).
         """
         super().__init__()
         assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
         assert e > 0, f"e must be > 0, got {e}"
+        assert mgs >= 1, f"mgs must be >= 1, got {mgs}"
 
         c_ = max(1, int(c2 * e))
         self.dw_k = dw_k
 
+        # Groups: pure DW (g=c1) when mgs=1, otherwise fewer groups for cross-channel mixing
+        g = c1 // mgs if mgs > 1 and c1 >= mgs else c1
+        self.dw_groups = g
+
         # Reparameterizable depthwise branches
         for ks in range(3, dw_k + 1, 2):
-            setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=c1, act=False))
+            setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=g, act=False))
         self.dw_bn_id = nn.BatchNorm2d(c1)
 
         # Pointwise head
@@ -1318,21 +1326,25 @@ class StarBottleneck(nn.Module):
 
     @torch.no_grad()
     def _fuse_dw(self):
-        """Fuse DW branches + BN-identity into one DW kxk conv."""
+        """Fuse DW branches + BN-identity into one grouped kxk conv."""
         k = self.dw_k
         center = k // 2
+        g = self.dw_groups
 
         bn = self.dw_bn_id
         ref = getattr(self, f"dw_conv{k}")
         c = ref.conv.out_channels
+        cpg = c // g  # channels per group
         device = ref.conv.weight.device
         dtype = ref.conv.weight.dtype
 
         gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
 
-        w_fused = torch.zeros(c, 1, k, k, device=device, dtype=dtype)
+        w_fused = torch.zeros(c, cpg, k, k, device=device, dtype=dtype)
         b_fused = torch.zeros(c, device=device, dtype=dtype)
-        w_fused[:, 0, center, center] += gamma
+        # BN-identity: each output i connects to input i within its group
+        for i in range(c):
+            w_fused[i, i % cpg, center, center] += gamma[i]
         b_fused += bn.bias - bn.running_mean * gamma
 
         for ks in range(3, k + 1, 2):
@@ -1344,7 +1356,7 @@ class StarBottleneck(nn.Module):
                 b_fused += fused_branch.bias
 
         conv = nn.Conv2d(
-            c, c, k, stride=1, padding=center, groups=c, bias=True, device=device, dtype=dtype,
+            c, c, k, stride=1, padding=center, groups=g, bias=True, device=device, dtype=dtype,
         ).requires_grad_(False)
         conv.weight.data.copy_(w_fused)
         conv.bias.data.copy_(b_fused)
@@ -1390,7 +1402,7 @@ class C2fStar(C2f):
     for position-sensitive self-attention.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, mgs: int = 1):
         """Initialize C2fStar.
 
         Args:
@@ -1402,15 +1414,16 @@ class C2fStar(C2f):
             shortcut (bool): Residual connection inside each StarBottleneck.
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
+            mgs (int): Min group size for DW conv in StarBottleneck.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(
             nn.Sequential(
-                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k),
+                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k)
+            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs)
             for _ in range(n)
         )
 

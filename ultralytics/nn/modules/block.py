@@ -1257,6 +1257,7 @@ class StarBottleneck(nn.Module):
         assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
         assert e > 0, f"e must be > 0, got {e}"
         assert mgs >= 1, f"mgs must be >= 1, got {mgs}"
+        assert mgs > c1 or c1 % mgs == 0, f"c1 must be divisible by mgs when mgs <= c1, got c1={c1}, mgs={mgs}"
 
         c_ = max(1, int(c2 * e))
         self.dw_k = dw_k

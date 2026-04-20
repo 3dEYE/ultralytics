@@ -1,11 +1,10 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# YOLO31: yolo30 + mgs=4 on P3-head too (all <=32ch layers get cross-channel mixing)
+# YOLO31: mgs=4 only on <=32ch layers (P2-bb, P3-bb, P3-head), rest pure DW
 
-# Parameters
-nc: 80 # number of classes
-end2end: False # NMS post-processing
-reg_max: 1 # DFL bins
+nc: 80
+end2end: False
+reg_max: 1
 scales:
   n: [0.50, 0.25, 1024]
   s: [0.50, 0.50, 1024]

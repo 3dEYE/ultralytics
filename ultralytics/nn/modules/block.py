@@ -1249,8 +1249,9 @@ class StarBottleneck(nn.Module):
             shortcut (bool): Use residual when c1 == c2.
             e (float): PW expansion ratio.
             dw_k (int): Max DW kernel size (odd, >= 3).
-            mgs (int): Min group size for DW conv — channels per group. 1 = pure DW,
-                       4 = each filter sees 4 channels (adds cross-channel spatial mixing at low c).
+            mgs (int): Min group size — channels per group in spatial conv.
+                       1 = pure depthwise (each filter sees 1 channel).
+                       N = each filter sees N channels (cross-channel spatial mixing).
         """
         super().__init__()
         assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
@@ -1260,11 +1261,11 @@ class StarBottleneck(nn.Module):
         c_ = max(1, int(c2 * e))
         self.dw_k = dw_k
 
-        # Groups: pure DW (g=c1) when mgs=1, otherwise fewer groups for cross-channel mixing
+        # Groups for spatial conv: fewer groups = more cross-channel mixing
         g = c1 // mgs if mgs > 1 and c1 >= mgs else c1
         self.dw_groups = g
 
-        # Reparameterizable depthwise branches
+        # Reparameterizable spatial branches
         for ks in range(3, dw_k + 1, 2):
             setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=g, act=False))
         self.dw_bn_id = nn.BatchNorm2d(c1)
@@ -1414,7 +1415,7 @@ class C2fStar(C2f):
             shortcut (bool): Residual connection inside each StarBottleneck.
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
-            mgs (int): Min group size for DW conv in StarBottleneck.
+            mgs (int): Min group size forwarded to StarBottleneck.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
         self.m = nn.ModuleList(

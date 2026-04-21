@@ -1472,7 +1472,7 @@ class C2fStar(C2f):
     for position-sensitive self-attention.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, mgs: int = 1, use_se: bool = True, use_dilated_rep: bool = True):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, mgs: int = 1, use_se: bool = True, use_dilated_rep: bool = True, se_stride: int = 2):
         """Initialize C2fStar.
 
         Args:
@@ -1485,14 +1485,16 @@ class C2fStar(C2f):
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
             mgs (int): Min group size forwarded to StarBottleneck.
-            use_se (bool): Enable RepViT-style SE on every second StarBottleneck (indices 1, 3, 5, ...).
+            use_se (bool): Master switch for RepViT-style SE inside StarBottleneck.
             use_dilated_rep (bool): Enable UniRepLKNet-style dilated rep branches inside StarBottleneck.
+            se_stride (int): When use_se=True, SE is enabled on blocks where (i + 1) % se_stride == 0.
+                Default 2 = every second block (RepViT pattern). Use 1 for SE on all blocks.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
+        assert se_stride >= 1, f"se_stride must be >= 1, got {se_stride}"
 
         def _sb(idx: int) -> StarBottleneck:
-            # RepViT pattern: SE on odd-indexed blocks so ~half the blocks carry channel gating.
-            se_here = use_se and (idx % 2 == 1)
+            se_here = use_se and ((idx + 1) % se_stride == 0)
             return StarBottleneck(
                 self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs,
                 use_se=se_here, use_dilated_rep=use_dilated_rep,

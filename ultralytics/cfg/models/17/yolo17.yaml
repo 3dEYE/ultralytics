@@ -5,6 +5,11 @@
 #   1) StarBottleneck γ_init=1.0 (was 1e-5) for short 100-epoch schedules.
 #   2) UniRepLKNet-style dilated rep branches in RepDW (zero inference cost after fuse).
 #   3) RepViT-style SE on every 2nd StarBottleneck (channel gating, minor param cost).
+#
+# KNOWN CAVEAT: with n=2 in YAML at scale=n (depth=0.5), actual_n rounds to 1.
+# SE fires on (idx+1) % 2 == 0, i.e. idx=1, so at actual_n=1 SE NEVER ACTIVATES here.
+# This YAML effectively runs as "γ + dilated rep only" (no SE). See yolo38 for the
+# depth-bumped variant (n=4 -> actual_n=2) where SE activates as intended.
 
 # Parameters
 nc: 80 # number of classes

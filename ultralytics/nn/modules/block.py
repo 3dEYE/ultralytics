@@ -1226,15 +1226,45 @@ class SEB(nn.Module):
         return x * self.fc(self.pool(x))
 
 
-class StarBottleneck(nn.Module):
-    """Inverted bottleneck with RepDW and layer scale (MobileNetV2-style).
+class SEBlock(nn.Module):
+    """Squeeze-and-Excitation gate (RepViT-style, 1x1 Conv variant).
 
-    RepDW kxk ── PW-expand (Hardswish) ── PW-project ── gamma*out + residual
+    GAP ── 1x1(c→c/r) ── ReLU ── 1x1(c/r→c) ── Sigmoid ── channel-wise multiply.
+    """
+
+    def __init__(self, c: int, r: int = 16):
+        """Initialize SE block.
+
+        Args:
+            c (int): Number of channels.
+            r (int): Reduction ratio.
+        """
+        super().__init__()
+        h = max(1, c // r)
+        self.fc1 = nn.Conv2d(c, h, 1, bias=True)
+        self.fc2 = nn.Conv2d(h, c, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply channel-wise gating."""
+        s = x.mean(dim=(2, 3), keepdim=True)
+        s = F.relu(self.fc1(s), inplace=True)
+        s = torch.sigmoid(self.fc2(s))
+        return x * s
+
+
+class StarBottleneck(nn.Module):
+    """Inverted bottleneck with RepDW + optional dilated rep + optional SE + layer scale.
+
+    RepDW kxk (+ dilated 3×3 branches) ── PW-expand (Hardswish) ── PW-project
+    ── γ ── [SE] ── + residual
 
     Notes:
-        - All DW branches + BN-identity fuse into a single grouped kxk conv at inference.
-        - Gamma is absorbed into the last PW conv.
+        - All DW branches (dense + dilated) + BN-identity fuse into a single grouped kxk conv at inference.
+        - γ is absorbed into the last PW conv (applied BEFORE SE, so SE sees scaled features; safe since γ_init=1.0).
+        - SE is dynamic (input-dependent), does not fuse. Cost ≈ 2·c²/r params, negligible FLOPs.
         - gamma_init=1.0 (tuned for short ~100 epoch schedules; 1e-5 is for 300+ epoch ConvNeXt regimes).
+        - use_dilated_rep (UniRepLKNet-style): adds DW_3×3 with dilations d∈[2..dw_k//2],
+          giving effective RF (2d+1) while fitting within the kxk fuse window → zero inference cost.
     """
 
     def __init__(
@@ -1245,6 +1275,8 @@ class StarBottleneck(nn.Module):
         e: float = 2.0,
         dw_k: int = 7,
         mgs: int = 1,
+        use_se: bool = False,
+        use_dilated_rep: bool = True,
     ):
         """Initialize StarBottleneck.
 
@@ -1257,6 +1289,8 @@ class StarBottleneck(nn.Module):
             mgs (int): Min group size — channels per group in spatial conv.
                        1 = pure depthwise (each filter sees 1 channel).
                        N = each filter sees N channels (cross-channel spatial mixing).
+            use_se (bool): Append SE gate after PW-project (RepViT-style).
+            use_dilated_rep (bool): Add dilated 3×3 rep branches (UniRepLKNet-style) when dw_k >= 5.
         """
         super().__init__()
         assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
@@ -1271,10 +1305,15 @@ class StarBottleneck(nn.Module):
         g = c1 // mgs if mgs > 1 and c1 >= mgs else c1
         self.dw_groups = g
 
-        # Reparameterizable spatial branches
+        # Dense reparameterizable spatial branches (3×3, 5×5, ..., dw_k×dw_k)
         for ks in range(3, dw_k + 1, 2):
             setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=g, act=False))
         self.dw_bn_id = nn.BatchNorm2d(c1)
+
+        # Dilated 3×3 branches — effective kernel 2d+1 fits within dw_k window (zero inference cost after fuse).
+        self.dw_dilations = tuple(range(2, dw_k // 2 + 1)) if use_dilated_rep else ()
+        for d in self.dw_dilations:
+            setattr(self, f"dw_conv_d{d}", Conv(c1, c1, 3, 1, d, g=g, d=d, act=False))
 
         # Pointwise head (classic inverted bottleneck).
         self.pw = nn.Sequential(
@@ -1282,16 +1321,20 @@ class StarBottleneck(nn.Module):
             Conv(c_, c2, 1, 1, act=False),
         )
 
+        self.se = SEBlock(c2, r=16) if use_se else None
+
         self.add = shortcut and c1 == c2
         # gamma_init=1.0: layer-scale with gamma=1e-5 is tuned for 300+ epoch regimes;
         # on short (~100 epoch) schedules it suppresses the block into an identity early on.
         self.gamma = nn.Parameter(torch.ones(c2)) if self.add else None
 
     def _mix(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply DW branches."""
+        """Apply DW branches (dense + dilated + BN-identity)."""
         out = self.dw_bn_id(x)
         for ks in range(3, self.dw_k + 1, 2):
             out = out + getattr(self, f"dw_conv{ks}")(x)
+        for d in self.dw_dilations:
+            out = out + getattr(self, f"dw_conv_d{d}")(x)
         return out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -1300,15 +1343,19 @@ class StarBottleneck(nn.Module):
             return self._forward_flat(x)
         mixed = self._mix(x)
         out = self.pw(mixed)
-        if self.add:
-            out = x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
-        return out
+        if self.gamma is not None:
+            out = out * self.gamma.view(1, -1, 1, 1)
+        if self.se is not None:
+            out = self.se(out)
+        return x + out if self.add else out
 
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
         """Fused inference forward using flat Conv2d ops."""
         out = self.dw_conv(x)
         out = self.pw_act(self.pw1(out))
         out = self.pw2(out)
+        if self.se is not None:
+            out = self.se(out)
         return x + out if self.add else out
 
     @torch.no_grad()
@@ -1363,6 +1410,17 @@ class StarBottleneck(nn.Module):
             if fused_branch.bias is not None:
                 b_fused += fused_branch.bias
 
+        # Dilated 3×3 branches: place 9 weights onto a sparse kxk grid at offsets ±d from center.
+        for d in self.dw_dilations:
+            branch = getattr(self, f"dw_conv_d{d}")
+            fused_branch = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
+            w = fused_branch.weight  # [c, cpg, 3, 3]
+            for i in range(3):
+                for j in range(3):
+                    w_fused[:, :, center + (i - 1) * d, center + (j - 1) * d] += w[:, :, i, j]
+            if fused_branch.bias is not None:
+                b_fused += fused_branch.bias
+
         conv = nn.Conv2d(
             c, c, k, stride=1, padding=center, groups=g, bias=True, device=device, dtype=dtype,
         ).requires_grad_(False)
@@ -1371,6 +1429,8 @@ class StarBottleneck(nn.Module):
 
         for ks in range(3, k + 1, 2):
             delattr(self, f"dw_conv{ks}")
+        for d in self.dw_dilations:
+            delattr(self, f"dw_conv_d{d}")
         del self.dw_bn_id
         return conv
 
@@ -1412,7 +1472,7 @@ class C2fStar(C2f):
     for position-sensitive self-attention.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, mgs: int = 1):
+    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, mgs: int = 1, use_se: bool = True, use_dilated_rep: bool = True):
         """Initialize C2fStar.
 
         Args:
@@ -1425,16 +1485,27 @@ class C2fStar(C2f):
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
             mgs (int): Min group size forwarded to StarBottleneck.
+            use_se (bool): Enable RepViT-style SE on every second StarBottleneck (indices 1, 3, 5, ...).
+            use_dilated_rep (bool): Enable UniRepLKNet-style dilated rep branches inside StarBottleneck.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
+
+        def _sb(idx: int) -> StarBottleneck:
+            # RepViT pattern: SE on odd-indexed blocks so ~half the blocks carry channel gating.
+            se_here = use_se and (idx % 2 == 1)
+            return StarBottleneck(
+                self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs,
+                use_se=se_here, use_dilated_rep=use_dilated_rep,
+            )
+
         self.m = nn.ModuleList(
             nn.Sequential(
-                StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs),
+                _sb(i),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs)
-            for _ in range(n)
+            else _sb(i)
+            for i in range(n)
         )
 
 

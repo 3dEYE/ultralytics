@@ -1,6 +1,7 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
 
-# YOLO30: mgs=4 on ALL C2fStar layers (mild cross-channel mixing everywhere)
+# YOLO30: StarNet-style C2fStar (PW_gate split + star op). uib_e tuned so that
+# PW FLOPs (3·e·c²) stay within the original budget (was 2·e_old·c²).
 
 nc: 80
 end2end: False
@@ -15,31 +16,31 @@ scales:
 backbone:
   - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
   - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
-  - [-1, 2, C2fStar, [256, 0.25, False, True, 6.0, 5, 4]] # 2
+  - [-1, 2, C2fStar, [256, 0.25, False, True, 4.0, 5, 4]] # 2
   - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 2, C2fStar, [512, 0.25, False, True, 4.0, 5, 4]] # 4
+  - [-1, 2, C2fStar, [512, 0.25, False, True, 2.5, 5, 4]] # 4
   - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
-  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5, 4]] # 6
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 1.25, 5, 4]] # 6
   - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
-  - [-1, 2, C2fStar, [1024, 0.5, False, True, 2.0, 7, 4]] # 8
+  - [-1, 2, C2fStar, [1024, 0.5, False, True, 1.25, 7, 4]] # 8
   - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
   - [-1, 2, C2PSA, [1024]] # 10
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 6], 1, Concat, [1]]
-  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5, 4]] # 13
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 1.25, 5, 4]] # 13
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
   - [[-1, 4], 1, Concat, [1]]
-  - [-1, 2, C2fStar, [256, 0.5, False, True, 2.0, 7, 4]] # 16
+  - [-1, 2, C2fStar, [256, 0.5, False, True, 1.25, 7, 4]] # 16
 
   - [-1, 1, Conv, [256, 3, 2]]
   - [[-1, 13], 1, Concat, [1]]
-  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5, 4]] # 19
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 1.25, 5, 4]] # 19
 
   - [-1, 1, Conv, [512, 3, 2]]
   - [[-1, 10], 1, Concat, [1]]
-  - [-1, 1, C2fStar, [1024, 0.5, True, True, 2.0, 7, 4]] # 22
+  - [-1, 1, C2fStar, [1024, 0.5, True, True, 1.25, 7, 4]] # 22
 
   - [[16, 19, 22], 1, Detect, [nc]]

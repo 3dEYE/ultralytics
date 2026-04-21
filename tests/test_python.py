@@ -584,6 +584,27 @@ def test_nn_modules_block():
     BottleneckCSP(c1, c2)(x)
 
 
+def test_star_bottleneck_fuse_and_validation():
+    """Test StarBottleneck output parity after fuse and validate grouped-kernel config."""
+    import copy as cp
+
+    from ultralytics.nn.modules.block import StarBottleneck
+
+    torch.manual_seed(0)
+    x = torch.randn(2, 32, 16, 16)
+    m = StarBottleneck(32, 32, e=1.5, dw_k=7, mgs=4).eval()
+    y = m(x)
+
+    mf = cp.deepcopy(m).eval()
+    mf.fuse()
+    yf = mf(x)
+
+    assert torch.allclose(y, yf, atol=1e-6, rtol=1e-5)
+
+    with pytest.raises(AssertionError, match="c1 must be divisible by mgs"):
+        StarBottleneck(10, 10, mgs=3)
+
+
 @pytest.mark.skipif(not ONLINE, reason="environment is offline")
 def test_hub():
     """Test Ultralytics HUB functionalities."""

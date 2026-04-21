@@ -1223,13 +1223,18 @@ class SEB(nn.Module):
 
 
 class StarBottleneck(nn.Module):
-    """Inverted bottleneck with RepDW and layer scale.
+    """StarNet-style bottleneck with RepDW spatial mixer and multiplicative gating.
 
-    RepDW kxk ── PW-expand (Hardswish) ── PW-project ── gamma*out + residual
+    RepDW kxk ── PW_gate (c → 2·ec, split) ── act(a) * b ── PW_proj ── gamma*out + residual
+
+    The star operation ``act(a) * b`` yields an implicit high-dimensional mapping
+    (see "Rewrite the Stars", CVPR 2024) at lower PW FLOPs than a MobileNetV2
+    inverted bottleneck of comparable capacity.
 
     Notes:
-        - All DW branches + BN-identity fuse into a single DW conv at inference.
-        - Gamma is absorbed into the last PW conv.
+        - All DW branches + BN-identity fuse into a single grouped kxk conv at inference.
+        - Gamma is absorbed into PW_proj.
+        - ``e=1.0`` is the budget-friendly default; star-op compensates for the lower ratio.
     """
 
     def __init__(
@@ -1237,7 +1242,7 @@ class StarBottleneck(nn.Module):
         c1: int,
         c2: int,
         shortcut: bool = True,
-        e: float = 2.0,
+        e: float = 1.0,
         dw_k: int = 7,
         mgs: int = 1,
     ):
@@ -1247,7 +1252,7 @@ class StarBottleneck(nn.Module):
             c1 (int): Input channels.
             c2 (int): Output channels.
             shortcut (bool): Use residual when c1 == c2.
-            e (float): PW expansion ratio.
+            e (float): PW expansion ratio for the star hidden dim.
             dw_k (int): Max DW kernel size (odd, >= 3).
             mgs (int): Min group size — channels per group in spatial conv.
                        1 = pure depthwise (each filter sees 1 channel).
@@ -1260,6 +1265,7 @@ class StarBottleneck(nn.Module):
         assert mgs > c1 or c1 % mgs == 0, f"c1 must be divisible by mgs when mgs <= c1, got c1={c1}, mgs={mgs}"
 
         c_ = max(1, int(c2 * e))
+        self.c_ = c_
         self.dw_k = dw_k
 
         # Groups for spatial conv: fewer groups = more cross-channel mixing
@@ -1271,14 +1277,18 @@ class StarBottleneck(nn.Module):
             setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=g, act=False))
         self.dw_bn_id = nn.BatchNorm2d(c1)
 
-        # Pointwise head
-        self.pw = nn.Sequential(
-            Conv(c1, c_, 1, 1, act=nn.Hardswish()),
-            Conv(c_, c2, 1, 1, act=False),
-        )
+        # Star-op pointwise head: single gate conv producing both branches, then project.
+        # ReLU6 is canonical for StarNet: cheap, quantization-friendly, and the star
+        # multiplication already provides the main nonlinear capacity.
+        self.pw_gate = Conv(c1, 2 * c_, 1, 1, act=False)
+        # Non-inplace: ``a`` is a view from ``split`` and cannot be modified in place.
+        self.star_act = nn.ReLU6()
+        self.pw_proj = Conv(c_, c2, 1, 1, act=False)
 
         self.add = shortcut and c1 == c2
-        self.gamma = nn.Parameter(1e-5 * torch.ones(c2)) if self.add else None
+        # gamma_init=1.0: layer-scale with gamma=1e-5 is tuned for 300+ epoch regimes;
+        # on short (~100 epoch) schedules it suppresses the block into an identity early on.
+        self.gamma = nn.Parameter(torch.ones(c2)) if self.add else None
 
     def _mix(self, x: torch.Tensor) -> torch.Tensor:
         """Apply DW branches."""
@@ -1287,12 +1297,17 @@ class StarBottleneck(nn.Module):
             out = out + getattr(self, f"dw_conv{ks}")(x)
         return out
 
+    def _star(self, t: torch.Tensor) -> torch.Tensor:
+        """Split gate output into (a, b) and apply star op ``act(a) * b``."""
+        a, b = t.split(self.c_, dim=1)
+        return self.star_act(a) * b
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through StarBottleneck."""
         if hasattr(self, "dw_conv"):
             return self._forward_flat(x)
-        mixed = self._mix(x)
-        out = self.pw(mixed)
+        gated = self._star(self.pw_gate(self._mix(x)))
+        out = self.pw_proj(gated)
         if self.add:
             out = x + out * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + out
         return out
@@ -1300,19 +1315,18 @@ class StarBottleneck(nn.Module):
     def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
         """Fused inference forward using flat Conv2d ops."""
         out = self.dw_conv(x)
-
-        out = F.hardswish(self.pw1(out))
-        out = self.pw2(out)
+        out = self._star(self.pw_gate_conv(out))
+        out = self.pw_proj_conv(out)
         return x + out if self.add else out
 
     @torch.no_grad()
     def fuse_layer_scale(self):
-        """Absorb gamma into the last PW conv."""
+        """Absorb gamma into PW_proj."""
         if self.gamma is None:
             return
 
         gamma = self.gamma.data
-        last_conv = self.pw[-1]
+        last_conv = self.pw_proj
 
         if hasattr(last_conv, "bn"):
             last_conv.conv = fuse_conv_and_bn(last_conv.conv, last_conv.bn)
@@ -1376,22 +1390,23 @@ class StarBottleneck(nn.Module):
 
         dw_conv = self._fuse_dw()
 
-        for m in self.pw:
-            if isinstance(m, Conv) and hasattr(m, "bn"):
+        for m in (self.pw_gate, self.pw_proj):
+            if hasattr(m, "bn"):
                 m.conv = fuse_conv_and_bn(m.conv, m.bn)
                 delattr(m, "bn")
                 m.forward = m.forward_fuse
 
         self.fuse_layer_scale()
 
-        pw1 = self.pw[0].conv
-        pw2 = self.pw[1].conv
+        pw_gate_conv = self.pw_gate.conv
+        pw_proj_conv = self.pw_proj.conv
 
-        del self.pw
+        del self.pw_gate
+        del self.pw_proj
 
         self.dw_conv = dw_conv
-        self.pw1 = pw1
-        self.pw2 = pw2
+        self.pw_gate_conv = pw_gate_conv
+        self.pw_proj_conv = pw_proj_conv
 
 
 class C2fStar(C2f):

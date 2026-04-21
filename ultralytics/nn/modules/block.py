@@ -54,6 +54,10 @@ __all__ = (
     "SEB",
     "StarBottleneck",
     "RepNCSPELAN4",
+    "RepPConvBottleneck",
+    "C2fRepPConv",
+    "PConv",
+    "EMA",
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
@@ -1446,6 +1450,276 @@ class C2fStar(C2f):
             )
             if attn
             else StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs)
+            for _ in range(n)
+        )
+
+
+class PConv(nn.Module):
+    """Partial Convolution (FasterNet, CVPR 2023).
+
+    Applies a kxk Conv to only the first ``c // n_div`` channels and leaves the
+    remaining channels untouched, then concatenates. Skips ~(1 - 1/n_div) of the
+    spatial FLOPs of a dense Conv while preserving full channel bandwidth.
+    """
+
+    def __init__(self, c: int, k: int = 3, n_div: int = 4, act: bool = True):
+        """Initialize PConv.
+
+        Args:
+            c (int): Total channels (in == out).
+            k (int): Spatial kernel size.
+            n_div (int): 1/n_div channels are processed; the rest pass through.
+            act (bool): Apply activation after the partial conv.
+        """
+        super().__init__()
+        assert c % n_div == 0, f"c must be divisible by n_div, got c={c}, n_div={n_div}"
+        self.c_active = c // n_div
+        self.c_rest = c - self.c_active
+        self.conv = Conv(self.c_active, self.c_active, k, 1, k // 2, act=act)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Split, convolve the active slice, and re-concatenate."""
+        x1, x2 = x[:, : self.c_active], x[:, self.c_active :]
+        x1 = self.conv(x1)
+        return torch.cat((x1, x2), dim=1)
+
+
+class EMA(nn.Module):
+    """Efficient Multi-scale Attention (Ouyang et al. 2023, arXiv:2305.13563).
+
+    Parallel 1x1 and 3x3 grouped paths, cross-calibrated via a softmax over pooled
+    features, producing channel-spatial attention weights. Cheap, parameter-light,
+    drop-in for YOLO backbones.
+    """
+
+    def __init__(self, c: int, factor: int = 8):
+        """Initialize EMA.
+
+        Args:
+            c (int): Input/output channels.
+            factor (int): Group factor; c must be divisible by factor.
+        """
+        super().__init__()
+        self.groups = max(1, c // factor) if c >= factor else 1
+        assert c % self.groups == 0, f"c must be divisible by groups, got c={c}, groups={self.groups}"
+        cg = c // self.groups
+        # GN normalizes per group-of-channels after reshape to (B*g, cg, H, W).
+        self.gn = nn.GroupNorm(num_groups=1, num_channels=cg)
+        self.agp = nn.AdaptiveAvgPool2d(1)
+        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
+        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
+        self.conv1x1 = nn.Conv2d(cg, cg, 1, bias=False)
+        self.conv3x3 = nn.Conv2d(cg, cg, 3, padding=1, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply EMA attention."""
+        b, c, h, w = x.shape
+        g = self.groups
+        xg = x.reshape(b * g, c // g, h, w)
+
+        # 1x1 path: coordinate attention (H and W pooled then reconciled)
+        xh = self.pool_h(xg)                              # B*g, cg, H, 1
+        xw = self.pool_w(xg).permute(0, 1, 3, 2)          # B*g, cg, W, 1
+        hw = self.conv1x1(torch.cat([xh, xw], dim=2))
+        xh2, xw2 = torch.split(hw, [h, w], dim=2)
+        x1 = self.gn(xg * xh2.sigmoid() * xw2.permute(0, 1, 3, 2).sigmoid())
+
+        # 3x3 path
+        x2 = self.conv3x3(xg)
+
+        # Cross-calibration
+        x11 = self.agp(x1).reshape(b * g, -1, 1).permute(0, 2, 1).softmax(dim=-1)  # B*g, 1, cg
+        x12 = x2.reshape(b * g, c // g, -1)
+        x21 = self.agp(x2).reshape(b * g, -1, 1).permute(0, 2, 1).softmax(dim=-1)
+        x22 = x1.reshape(b * g, c // g, -1)
+        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * g, 1, h, w)
+        out = (xg * weights.sigmoid()).reshape(b, c, h, w)
+        return out
+
+
+class RepPConvBottleneck(nn.Module):
+    """RepC2f-PConv inner bottleneck.
+
+    PConv3x3(c/n_div) -> RepDW(3,5,id) -> PW(1x1) -> gamma*out + residual.
+
+    - PConv saves ~(1 - 1/n_div) of 3x3 FLOPs vs a dense 3x3.
+    - RepDW merges 3x3 + 5x5 DW + BN-identity into a single 5x5 DW at inference.
+    - gamma initialized to 1.0 (not 1e-5) — tuned for short (~100 epoch) schedules.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        shortcut: bool = True,
+        n_div: int = 4,
+        dw_k: int = 5,
+    ):
+        """Initialize RepPConvBottleneck.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels (must equal c1 for residual).
+            shortcut (bool): Use residual when c1 == c2.
+            n_div (int): PConv partial ratio (1 / n_div channels processed).
+            dw_k (int): Max RepDW kernel size (odd, >= 3).
+        """
+        super().__init__()
+        assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
+
+        self.pconv = PConv(c1, k=3, n_div=n_div, act=True)
+        self.dw_k = dw_k
+
+        # RepDW branches + BN-identity
+        for ks in range(3, dw_k + 1, 2):
+            setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=c1, act=False))
+        self.dw_bn_id = nn.BatchNorm2d(c1)
+        self.dw_act = nn.SiLU(inplace=True)
+
+        # Pointwise projection
+        self.pw = Conv(c1, c2, 1, 1, act=False)
+
+        self.add = shortcut and c1 == c2
+        self.gamma = nn.Parameter(torch.ones(c2)) if self.add else None
+
+    def _rep_dw(self, x: torch.Tensor) -> torch.Tensor:
+        """Multi-branch DW during training."""
+        out = self.dw_bn_id(x)
+        for ks in range(3, self.dw_k + 1, 2):
+            out = out + getattr(self, f"dw_conv{ks}")(x)
+        return out
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Forward pass."""
+        if hasattr(self, "dw_conv"):
+            y = self.pconv(x)
+            y = self.dw_act(self.dw_conv(y))
+            y = self.pw(y)
+        else:
+            y = self.pconv(x)
+            y = self.dw_act(self._rep_dw(y))
+            y = self.pw(y)
+        if self.add:
+            y = x + y * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + y
+        return y
+
+    @torch.no_grad()
+    def fuse_layer_scale(self):
+        """Absorb gamma into the pw conv."""
+        if self.gamma is None:
+            return
+        gamma = self.gamma.data
+        last = self.pw
+        if hasattr(last, "bn"):
+            last.conv = fuse_conv_and_bn(last.conv, last.bn)
+            delattr(last, "bn")
+            last.forward = last.forward_fuse
+        last.conv.weight.data *= gamma.view(-1, 1, 1, 1)
+        if last.conv.bias is not None:
+            last.conv.bias.data *= gamma
+        delattr(self, "gamma")
+        self.gamma = None
+
+    @torch.no_grad()
+    def _fuse_dw(self):
+        """Fuse RepDW branches + BN-identity into one DW kxk conv."""
+        k = self.dw_k
+        center = k // 2
+        ref = getattr(self, f"dw_conv{k}")
+        c = ref.conv.out_channels
+        device = ref.conv.weight.device
+        dtype = ref.conv.weight.dtype
+
+        bn = self.dw_bn_id
+        gamma_bn = bn.weight / (bn.running_var + bn.eps).sqrt()
+        w_fused = torch.zeros(c, 1, k, k, device=device, dtype=dtype)
+        b_fused = torch.zeros(c, device=device, dtype=dtype)
+        for i in range(c):
+            w_fused[i, 0, center, center] += gamma_bn[i]
+        b_fused += bn.bias - bn.running_mean * gamma_bn
+
+        for ks in range(3, k + 1, 2):
+            branch = getattr(self, f"dw_conv{ks}")
+            fused = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
+            pad = (k - ks) // 2
+            w_fused += F.pad(fused.weight, [pad, pad, pad, pad]) if pad else fused.weight
+            if fused.bias is not None:
+                b_fused += fused.bias
+
+        conv = nn.Conv2d(c, c, k, stride=1, padding=center, groups=c, bias=True,
+                         device=device, dtype=dtype).requires_grad_(False)
+        conv.weight.data.copy_(w_fused)
+        conv.bias.data.copy_(b_fused)
+
+        for ks in range(3, k + 1, 2):
+            delattr(self, f"dw_conv{ks}")
+        del self.dw_bn_id
+        return conv
+
+    @torch.no_grad()
+    def fuse(self):
+        """Fuse RepDW branches, PW BN, and layer scale."""
+        if hasattr(self, "dw_conv"):
+            return
+        dw_conv = self._fuse_dw()
+        if hasattr(self.pw, "bn"):
+            self.pw.conv = fuse_conv_and_bn(self.pw.conv, self.pw.bn)
+            delattr(self.pw, "bn")
+            self.pw.forward = self.pw.forward_fuse
+        self.fuse_layer_scale()
+        # fuse inner PConv BN too
+        if hasattr(self.pconv.conv, "bn"):
+            self.pconv.conv.conv = fuse_conv_and_bn(self.pconv.conv.conv, self.pconv.conv.bn)
+            delattr(self.pconv.conv, "bn")
+            self.pconv.conv.forward = self.pconv.conv.forward_fuse
+        self.dw_conv = dw_conv
+
+
+class C2fRepPConv(C2f):
+    """C2f with RepPConvBottleneck blocks and optional EMA attention.
+
+    1x1 -- split --+-- RepPConvBottleneck_1 -- ... -- RepPConvBottleneck_n [-- EMA] --+
+                   |                                                                  |-- concat -- 1x1
+                   +------------------------------------------------------------------+
+
+    When ``attn=True`` each bottleneck is followed by an EMA attention module.
+    """
+
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        e: float = 0.5,
+        attn: bool = False,
+        shortcut: bool = True,
+        n_div: int = 4,
+        dw_k: int = 5,
+    ):
+        """Initialize C2fRepPConv.
+
+        Args:
+            c1 (int): Input channels.
+            c2 (int): Output channels.
+            n (int): Number of RepPConvBottleneck repeats.
+            e (float): C2f split-channel ratio.
+            attn (bool): Append EMA after each bottleneck.
+            shortcut (bool): Residual inside each bottleneck.
+            n_div (int): PConv partial ratio forwarded to the bottleneck.
+            dw_k (int): Max RepDW kernel size forwarded to the bottleneck.
+        """
+        super().__init__(c1, c2, n, shortcut, e=e)
+        # Ensure c is divisible by n_div for PConv
+        assert self.c % n_div == 0, (
+            f"C2fRepPConv hidden channels c={self.c} must be divisible by n_div={n_div}"
+        )
+        self.m = nn.ModuleList(
+            nn.Sequential(
+                RepPConvBottleneck(self.c, self.c, shortcut, n_div=n_div, dw_k=dw_k),
+                EMA(self.c),
+            )
+            if attn
+            else RepPConvBottleneck(self.c, self.c, shortcut, n_div=n_div, dw_k=dw_k)
             for _ in range(n)
         )
 

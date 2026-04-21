@@ -1281,8 +1281,8 @@ class StarBottleneck(nn.Module):
         # ReLU6 is canonical for StarNet: cheap, quantization-friendly, and the star
         # multiplication already provides the main nonlinear capacity.
         self.pw_gate = Conv(c1, 2 * c_, 1, 1, act=False)
-        # Non-inplace: ``a`` is a view from ``split`` and cannot be modified in place.
-        self.star_act = nn.ReLU6()
+        # Functional ReLU6 (F.relu6) is used in _star to avoid any chance of an
+        # inplace variant mutating a split-view tensor (breaks autograd under AMP/MuSGD).
         self.pw_proj = Conv(c_, c2, 1, 1, act=False)
 
         self.add = shortcut and c1 == c2
@@ -1298,9 +1298,14 @@ class StarBottleneck(nn.Module):
         return out
 
     def _star(self, t: torch.Tensor) -> torch.Tensor:
-        """Split gate output into (a, b) and apply star op ``act(a) * b``."""
+        """Split gate output into (a, b) and apply star op ``relu6(a) * b``.
+
+        ``F.relu6`` is used (not an ``nn.Module``) so the op cannot accidentally be
+        switched to an inplace variant that would mutate a view returned by ``split``
+        (which breaks autograd, e.g. under AMP / MuSGD).
+        """
         a, b = t.split(self.c_, dim=1)
-        return self.star_act(a) * b
+        return F.relu6(a) * b
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through StarBottleneck."""

@@ -1,0 +1,57 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO40 (Variant #2 from 6-probe): head-weakening rebalance, NO SCDown.
+# Control experiment: isolates contribution of (head n=4 -> n=2) + backbone uib_e bump.
+#
+# Changes vs yolo39:
+#   - Head C2fStar depth: n=4 -> n=2 (all 4 head blocks) → -12 layers (131→119)
+#   - Backbone uib_e: P3 4.0 -> 5.0, P4 2.5 -> 4.0, P5 2.5 -> 4.0
+#   - Everything else identical to yolo39.
+#
+# Probe: 2.44M params, 5.34 GFLOPs, 119 layers. Budget-fit vs yolo26n (2.41M, 5.36, 120).
+
+# C2fStar args: [c2, e, attn, shortcut, uib_e, dw_k, mgs, use_se, use_dilated_rep]
+
+# Parameters
+nc: 80
+end2end: False
+reg_max: 1
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C2fStar, [256, 0.25, False, True, 6.0, 5, 1, False, False]] # 2
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C2fStar, [512, 0.25, False, True, 5.0, 5, 1, False, False]] # 4  (uib_e 4.0 -> 5.0)
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 4.0, 5, 1, False, False]] # 6   (uib_e 2.5 -> 4.0)
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 4, C2fStar, [1024, 0.5, False, True, 4.0, 7, 1, False, False]] # 8  (uib_e 2.5 -> 4.0)
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5, 1, False, False]] # 13  (n: 4 -> 2)
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
+  - [-1, 2, C2fStar, [256, 0.5, False, True, 2.0, 7, 1, False, False]] # 16  (n: 4 -> 2)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]] # cat head P4
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5, 1, False, False]] # 19  (n: 4 -> 2)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]] # cat head P5
+  - [-1, 2, C2fStar, [1024, 0.5, True, True, 2.0, 7, 1, False, False]] # 22
+
+  - [[16, 19, 22], 1, Detect, [nc]] # Detect(P3, P4, P5)

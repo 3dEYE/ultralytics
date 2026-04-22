@@ -1,27 +1,25 @@
 # Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
-
+#
 # YOLO39: dense inverted bottleneck — NO regularizers, increased capacity.
 # Hypothesis: on Hard-COCO (n-scale, 150ep) regularizers (SE, dilated rep) add
 # no value (yolo38 vs yolo26n showed -0.008 mAP gap after 150ep with both enabled).
 # Instead of regularization, spend the compute budget on raw inverted-bottleneck capacity.
 #
 # Changes vs yolo38:
-#   - use_se = False          (SE contribution measured ~0 on Hard-COCO)
-#   - use_dilated_rep = False (dilated rep contribution measured ~0)
+#   - Removed SE, dilated rep, cross-channel grouping (mgs) — empirically ~0 effect on Hard-COCO
 #   - uib_e P4/P5: 2.0 -> 2.5 (spend freed compute on PW-expand capacity)
 #   - Depth-up from yolo38 retained (n=4 on P4/P5 + head)
-#   - γ_init=1.0 retained (last surviving point-fix)
+#   - gamma_init=1.0 retained (last surviving point-fix)
 #
 # Target: ~5.4 GFLOPs, ~2.37M params (matches yolo26n's 5.4 GFLOPs, 2.41M params).
-
-# C2fStar args: [c2, e, attn, shortcut, uib_e, dw_k, mgs, use_se, use_dilated_rep]
+#
+# C2fStar args: [c2, e, attn, shortcut, uib_e, dw_k]
 
 # Parameters
-nc: 80 # number of classes
-end2end: False # NMS post-processing
-reg_max: 1 # DFL bins
-scales: # model compound scaling constants
-  # [depth, width, max_channels]
+nc: 80
+end2end: False
+reg_max: 1
+scales:
   n: [0.50, 0.25, 1024]
   s: [0.50, 0.50, 1024]
   m: [0.50, 1.00, 512]
@@ -29,34 +27,33 @@ scales: # model compound scaling constants
   x: [1.00, 1.50, 512]
 
 backbone:
-  # [from, repeats, module, args]
   - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
   - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
-  - [-1, 2, C2fStar, [256, 0.25, False, True, 6.0, 5, 1, False, False]] # 2
+  - [-1, 2, C2fStar, [256, 0.25, False, True, 6.0, 5]] # 2
   - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
-  - [-1, 2, C2fStar, [512, 0.25, False, True, 4.0, 5, 1, False, False]] # 4
+  - [-1, 2, C2fStar, [512, 0.25, False, True, 4.0, 5]] # 4
   - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
-  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.5, 5, 1, False, False]] # 6   (uib_e 2.0 -> 2.5)
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.5, 5]] # 6
   - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
-  - [-1, 4, C2fStar, [1024, 0.5, False, True, 2.5, 7, 1, False, False]] # 8  (uib_e 2.0 -> 2.5)
+  - [-1, 4, C2fStar, [1024, 0.5, False, True, 2.5, 7]] # 8
   - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
   - [-1, 2, C2PSA, [1024]] # 10
 
 head:
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 6], 1, Concat, [1]] # cat backbone P4
-  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.0, 5, 1, False, False]] # 13
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.0, 5]] # 13
 
   - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
-  - [[-1, 4], 1, Concat, [1]] # cat backbone P3
-  - [-1, 4, C2fStar, [256, 0.5, False, True, 2.0, 7, 1, False, False]] # 16
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 4, C2fStar, [256, 0.5, False, True, 2.0, 7]] # 16
 
   - [-1, 1, Conv, [256, 3, 2]]
-  - [[-1, 13], 1, Concat, [1]] # cat head P4
-  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.0, 5, 1, False, False]] # 19
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.0, 5]] # 19
 
   - [-1, 1, Conv, [512, 3, 2]]
-  - [[-1, 10], 1, Concat, [1]] # cat head P5
-  - [-1, 2, C2fStar, [1024, 0.5, True, True, 2.0, 7, 1, False, False]] # 22
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 2, C2fStar, [1024, 0.5, True, True, 2.0, 7]] # 22
 
-  - [[16, 19, 22], 1, Detect, [nc]] # Detect(P3, P4, P5)
+  - [[16, 19, 22], 1, Detect, [nc]]

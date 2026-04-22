@@ -1226,45 +1226,17 @@ class SEB(nn.Module):
         return x * self.fc(self.pool(x))
 
 
-class SEBlock(nn.Module):
-    """Squeeze-and-Excitation gate (RepViT-style, 1x1 Conv variant).
-
-    GAP ── 1x1(c→c/r) ── ReLU ── 1x1(c/r→c) ── Sigmoid ── channel-wise multiply.
-    """
-
-    def __init__(self, c: int, r: int = 16):
-        """Initialize SE block.
-
-        Args:
-            c (int): Number of channels.
-            r (int): Reduction ratio.
-        """
-        super().__init__()
-        h = max(1, c // r)
-        self.fc1 = nn.Conv2d(c, h, 1, bias=True)
-        self.fc2 = nn.Conv2d(h, c, 1, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply channel-wise gating."""
-        s = x.mean(dim=(2, 3), keepdim=True)
-        s = F.relu(self.fc1(s), inplace=True)
-        s = torch.sigmoid(self.fc2(s))
-        return x * s
-
-
 class StarBottleneck(nn.Module):
-    """Inverted bottleneck with RepDW + optional dilated rep + optional SE + layer scale.
+    """Inverted bottleneck with reparameterizable depthwise branches.
 
-    RepDW kxk (+ dilated 3×3 branches) ── PW-expand (Hardswish) ── PW-project
-    ── γ ── [SE] ── + residual
+    RepDW kxk ── PW-expand (Hardswish) ── PW-project ── + residual
 
     Notes:
-        - All DW branches (dense + dilated) + BN-identity fuse into a single grouped kxk conv at inference.
-        - γ is absorbed into the last PW conv (applied BEFORE SE, so SE sees scaled features; safe since γ_init=1.0).
-        - SE is dynamic (input-dependent), does not fuse. Cost ≈ 2·c²/r params, negligible FLOPs.
-        - gamma_init=1.0 (tuned for short ~100 epoch schedules; 1e-5 is for 300+ epoch ConvNeXt regimes).
-        - use_dilated_rep (UniRepLKNet-style): adds DW_3×3 with dilations d∈[2..dw_k//2],
-          giving effective RF (2d+1) while fitting within the kxk fuse window → zero inference cost.
+        - Dense DW branches (3×3, 5×5, ..., dw_k×dw_k) + BN-identity fuse into a single
+          depthwise kxk conv at inference.
+        - No layer-scale (γ): the BN inside PW-project already parameterizes output
+          scale, and a separate γ_init is schedule-dependent (1e-5 for 300+ep,
+          1.0 for 100ep) without representational benefit on top of BN.
     """
 
     def __init__(
@@ -1274,9 +1246,6 @@ class StarBottleneck(nn.Module):
         shortcut: bool = True,
         e: float = 2.0,
         dw_k: int = 7,
-        mgs: int = 1,
-        use_se: bool = False,
-        use_dilated_rep: bool = True,
     ):
         """Initialize StarBottleneck.
 
@@ -1286,34 +1255,18 @@ class StarBottleneck(nn.Module):
             shortcut (bool): Use residual when c1 == c2.
             e (float): PW expansion ratio.
             dw_k (int): Max DW kernel size (odd, >= 3).
-            mgs (int): Min group size — channels per group in spatial conv.
-                       1 = pure depthwise (each filter sees 1 channel).
-                       N = each filter sees N channels (cross-channel spatial mixing).
-            use_se (bool): Append SE gate after PW-project (RepViT-style).
-            use_dilated_rep (bool): Add dilated 3×3 rep branches (UniRepLKNet-style) when dw_k >= 5.
         """
         super().__init__()
         assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
         assert e > 0, f"e must be > 0, got {e}"
-        assert mgs >= 1, f"mgs must be >= 1, got {mgs}"
-        assert mgs > c1 or c1 % mgs == 0, f"c1 must be divisible by mgs when mgs <= c1, got c1={c1}, mgs={mgs}"
 
         c_ = max(1, int(c2 * e))
         self.dw_k = dw_k
 
-        # Groups for spatial conv: fewer groups = more cross-channel mixing
-        g = c1 // mgs if mgs > 1 and c1 >= mgs else c1
-        self.dw_groups = g
-
-        # Dense reparameterizable spatial branches (3×3, 5×5, ..., dw_k×dw_k)
+        # Dense reparameterizable depthwise branches (3×3, 5×5, ..., dw_k×dw_k).
         for ks in range(3, dw_k + 1, 2):
-            setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=g, act=False))
+            setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=c1, act=False))
         self.dw_bn_id = nn.BatchNorm2d(c1)
-
-        # Dilated 3×3 branches — effective kernel 2d+1 fits within dw_k window (zero inference cost after fuse).
-        self.dw_dilations = tuple(range(2, dw_k // 2 + 1)) if use_dilated_rep else ()
-        for d in self.dw_dilations:
-            setattr(self, f"dw_conv_d{d}", Conv(c1, c1, 3, 1, d, g=g, d=d, act=False))
 
         # Pointwise head (classic inverted bottleneck).
         self.pw = nn.Sequential(
@@ -1321,145 +1274,72 @@ class StarBottleneck(nn.Module):
             Conv(c_, c2, 1, 1, act=False),
         )
 
-        self.se = SEBlock(c2, r=16) if use_se else None
-
         self.add = shortcut and c1 == c2
-        # gamma_init=1.0: layer-scale with gamma=1e-5 is tuned for 300+ epoch regimes;
-        # on short (~100 epoch) schedules it suppresses the block into an identity early on.
-        self.gamma = nn.Parameter(torch.ones(c2)) if self.add else None
 
-    def _mix(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply DW branches (dense + dilated + BN-identity)."""
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Training forward: multi-branch DW + PW head + optional residual."""
         out = self.dw_bn_id(x)
         for ks in range(3, self.dw_k + 1, 2):
             out = out + getattr(self, f"dw_conv{ks}")(x)
-        for d in self.dw_dilations:
-            out = out + getattr(self, f"dw_conv_d{d}")(x)
-        return out
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass through StarBottleneck."""
-        if hasattr(self, "dw_conv"):
-            return self._forward_flat(x)
-        mixed = self._mix(x)
-        out = self.pw(mixed)
-        if self.gamma is not None:
-            out = out * self.gamma.view(1, -1, 1, 1)
-        if self.se is not None:
-            out = self.se(out)
+        out = self.pw(out)
         return x + out if self.add else out
 
-    def _forward_flat(self, x: torch.Tensor) -> torch.Tensor:
+    def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
         """Fused inference forward using flat Conv2d ops."""
-        out = self.dw_conv(x)
-        out = self.pw_act(self.pw1(out))
+        out = self.pw_act(self.pw1(self.dw_conv(x)))
         out = self.pw2(out)
-        if self.se is not None:
-            out = self.se(out)
         return x + out if self.add else out
-
-    @torch.no_grad()
-    def fuse_layer_scale(self):
-        """Absorb gamma into the last PW conv."""
-        if self.gamma is None:
-            return
-
-        gamma = self.gamma.data
-        last_conv = self.pw[-1]
-
-        if hasattr(last_conv, "bn"):
-            last_conv.conv = fuse_conv_and_bn(last_conv.conv, last_conv.bn)
-            delattr(last_conv, "bn")
-            last_conv.forward = last_conv.forward_fuse
-
-        last_conv.conv.weight.data *= gamma.view(-1, 1, 1, 1)
-        if last_conv.conv.bias is not None:
-            last_conv.conv.bias.data *= gamma
-
-        delattr(self, "gamma")
-        self.gamma = None
 
     @torch.no_grad()
     def _fuse_dw(self):
-        """Fuse DW branches + BN-identity into one grouped kxk conv."""
+        """Fuse DW branches + BN-identity into one depthwise kxk conv."""
         k = self.dw_k
         center = k // 2
-        g = self.dw_groups
-
         bn = self.dw_bn_id
-        ref = getattr(self, f"dw_conv{k}")
-        c = ref.conv.out_channels
-        cpg = c // g  # channels per group
-        device = ref.conv.weight.device
-        dtype = ref.conv.weight.dtype
+        ref = getattr(self, f"dw_conv{k}").conv
+        c, device, dtype = ref.out_channels, ref.weight.device, ref.weight.dtype
 
         gamma = bn.weight / (bn.running_var + bn.eps).sqrt()
-
-        w_fused = torch.zeros(c, cpg, k, k, device=device, dtype=dtype)
-        b_fused = torch.zeros(c, device=device, dtype=dtype)
-        # BN-identity: each output i connects to input i within its group
-        for i in range(c):
-            w_fused[i, i % cpg, center, center] += gamma[i]
-        b_fused += bn.bias - bn.running_mean * gamma
+        # Depthwise: each out-channel has a single 1×1 input slice (cpg=1).
+        # BN-identity contributes a center-tap of gamma[i] on channel i.
+        w = torch.zeros(c, 1, k, k, device=device, dtype=dtype)
+        w[:, 0, center, center] = gamma
+        b = bn.bias - bn.running_mean * gamma
 
         for ks in range(3, k + 1, 2):
             branch = getattr(self, f"dw_conv{ks}")
-            fused_branch = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
+            fused = fuse_conv_and_bn(branch.conv, branch.bn)
             pad = (k - ks) // 2
-            w_fused += F.pad(fused_branch.weight, [pad, pad, pad, pad]) if pad else fused_branch.weight
-            if fused_branch.bias is not None:
-                b_fused += fused_branch.bias
-
-        # Dilated 3×3 branches: place 9 weights onto a sparse kxk grid at offsets ±d from center.
-        for d in self.dw_dilations:
-            branch = getattr(self, f"dw_conv_d{d}")
-            fused_branch = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
-            w = fused_branch.weight  # [c, cpg, 3, 3]
-            for i in range(3):
-                for j in range(3):
-                    w_fused[:, :, center + (i - 1) * d, center + (j - 1) * d] += w[:, :, i, j]
-            if fused_branch.bias is not None:
-                b_fused += fused_branch.bias
-
-        conv = nn.Conv2d(
-            c, c, k, stride=1, padding=center, groups=g, bias=True, device=device, dtype=dtype,
-        ).requires_grad_(False)
-        conv.weight.data.copy_(w_fused)
-        conv.bias.data.copy_(b_fused)
-
-        for ks in range(3, k + 1, 2):
+            w = w + (F.pad(fused.weight, [pad] * 4) if pad else fused.weight)
+            if fused.bias is not None:
+                b = b + fused.bias
             delattr(self, f"dw_conv{ks}")
-        for d in self.dw_dilations:
-            delattr(self, f"dw_conv_d{d}")
         del self.dw_bn_id
+
+        conv = nn.Conv2d(c, c, k, 1, center, groups=c, bias=True, device=device, dtype=dtype)
+        conv.requires_grad_(False)  # match Ultralytics fuse_conv_and_bn convention
+        conv.weight.data.copy_(w)
+        conv.bias.data.copy_(b)
         return conv
 
     @torch.no_grad()
     def fuse(self):
-        """Fuse DW branches, PW BNs, and layer scale for flat inference."""
+        """Fuse DW branches and PW BNs for flat inference."""
         if hasattr(self, "dw_conv"):
             return  # already fused
 
-        dw_conv = self._fuse_dw()
+        self.dw_conv = self._fuse_dw()
 
-        for m in self.pw:
-            if isinstance(m, Conv) and hasattr(m, "bn"):
-                m.conv = fuse_conv_and_bn(m.conv, m.bn)
-                delattr(m, "bn")
-                m.forward = m.forward_fuse
+        pw_expand, pw_project = self.pw[0], self.pw[1]
+        pw_expand.conv = fuse_conv_and_bn(pw_expand.conv, pw_expand.bn)
+        pw_project.conv = fuse_conv_and_bn(pw_project.conv, pw_project.bn)
 
-        self.fuse_layer_scale()
-
-        pw1 = self.pw[0].conv
-        pw2 = self.pw[1].conv
-        pw_act = self.pw[0].act
-
+        self.pw1 = pw_expand.conv
+        self.pw2 = pw_project.conv
+        self.pw_act = pw_expand.act
         del self.pw
 
-        self.dw_conv = dw_conv
-        self.pw1 = pw1
-        self.pw2 = pw2
-        self.pw_act = pw_act
+        self.forward = self.forward_fuse
 
 
 class C2fStar(C2f):
@@ -1472,7 +1352,17 @@ class C2fStar(C2f):
     for position-sensitive self-attention.
     """
 
-    def __init__(self, c1: int, c2: int, n: int = 1, e: float = 0.5, attn: bool = False, shortcut: bool = True, uib_e: float = 2.0, dw_k: int = 7, mgs: int = 1, use_se: bool = True, use_dilated_rep: bool = True, se_stride: int = 2):
+    def __init__(
+        self,
+        c1: int,
+        c2: int,
+        n: int = 1,
+        e: float = 0.5,
+        attn: bool = False,
+        shortcut: bool = True,
+        uib_e: float = 2.0,
+        dw_k: int = 7,
+    ):
         """Initialize C2fStar.
 
         Args:
@@ -1484,299 +1374,19 @@ class C2fStar(C2f):
             shortcut (bool): Residual connection inside each StarBottleneck.
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
-            mgs (int): Min group size forwarded to StarBottleneck.
-            use_se (bool): Master switch for RepViT-style SE inside StarBottleneck.
-            use_dilated_rep (bool): Enable UniRepLKNet-style dilated rep branches inside StarBottleneck.
-            se_stride (int): When use_se=True, SE is enabled on blocks where (i + 1) % se_stride == 0.
-                Default 2 = every second block (RepViT pattern). Use 1 for SE on all blocks.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
-        assert se_stride >= 1, f"se_stride must be >= 1, got {se_stride}"
 
-        def _sb(idx: int) -> StarBottleneck:
-            se_here = use_se and ((idx + 1) % se_stride == 0)
-            return StarBottleneck(
-                self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, mgs=mgs,
-                use_se=se_here, use_dilated_rep=use_dilated_rep,
-            )
+        def _sb() -> StarBottleneck:
+            return StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k)
 
         self.m = nn.ModuleList(
             nn.Sequential(
-                _sb(i),
+                _sb(),
                 PSABlock(self.c, attn_ratio=0.5, num_heads=max(self.c // 64, 1)),
             )
             if attn
-            else _sb(i)
-            for i in range(n)
-        )
-
-
-class PConv(nn.Module):
-    """Partial Convolution (FasterNet, CVPR 2023).
-
-    Applies a kxk Conv to only the first ``c // n_div`` channels and leaves the
-    remaining channels untouched, then concatenates. Skips ~(1 - 1/n_div) of the
-    spatial FLOPs of a dense Conv while preserving full channel bandwidth.
-    """
-
-    def __init__(self, c: int, k: int = 3, n_div: int = 4, act: bool = True):
-        """Initialize PConv.
-
-        Args:
-            c (int): Total channels (in == out).
-            k (int): Spatial kernel size.
-            n_div (int): 1/n_div channels are processed; the rest pass through.
-            act (bool): Apply activation after the partial conv.
-        """
-        super().__init__()
-        assert c % n_div == 0, f"c must be divisible by n_div, got c={c}, n_div={n_div}"
-        self.c_active = c // n_div
-        self.c_rest = c - self.c_active
-        self.conv = Conv(self.c_active, self.c_active, k, 1, k // 2, act=act)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Split, convolve the active slice, and re-concatenate."""
-        x1, x2 = x[:, : self.c_active], x[:, self.c_active :]
-        x1 = self.conv(x1)
-        return torch.cat((x1, x2), dim=1)
-
-
-class EMA(nn.Module):
-    """Efficient Multi-scale Attention (Ouyang et al. 2023, arXiv:2305.13563).
-
-    Parallel 1x1 and 3x3 grouped paths, cross-calibrated via a softmax over pooled
-    features, producing channel-spatial attention weights. Cheap, parameter-light,
-    drop-in for YOLO backbones.
-    """
-
-    def __init__(self, c: int, factor: int = 8):
-        """Initialize EMA.
-
-        Args:
-            c (int): Input/output channels.
-            factor (int): Group factor; c must be divisible by factor.
-        """
-        super().__init__()
-        self.groups = max(1, c // factor) if c >= factor else 1
-        assert c % self.groups == 0, f"c must be divisible by groups, got c={c}, groups={self.groups}"
-        cg = c // self.groups
-        # GN normalizes per group-of-channels after reshape to (B*g, cg, H, W).
-        self.gn = nn.GroupNorm(num_groups=1, num_channels=cg)
-        self.agp = nn.AdaptiveAvgPool2d(1)
-        self.pool_h = nn.AdaptiveAvgPool2d((None, 1))
-        self.pool_w = nn.AdaptiveAvgPool2d((1, None))
-        self.conv1x1 = nn.Conv2d(cg, cg, 1, bias=False)
-        self.conv3x3 = nn.Conv2d(cg, cg, 3, padding=1, bias=False)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Apply EMA attention."""
-        b, c, h, w = x.shape
-        g = self.groups
-        xg = x.reshape(b * g, c // g, h, w)
-
-        # 1x1 path: coordinate attention (H and W pooled then reconciled)
-        xh = self.pool_h(xg)                              # B*g, cg, H, 1
-        xw = self.pool_w(xg).permute(0, 1, 3, 2)          # B*g, cg, W, 1
-        hw = self.conv1x1(torch.cat([xh, xw], dim=2))
-        xh2, xw2 = torch.split(hw, [h, w], dim=2)
-        x1 = self.gn(xg * xh2.sigmoid() * xw2.permute(0, 1, 3, 2).sigmoid())
-
-        # 3x3 path
-        x2 = self.conv3x3(xg)
-
-        # Cross-calibration
-        x11 = self.agp(x1).reshape(b * g, -1, 1).permute(0, 2, 1).softmax(dim=-1)  # B*g, 1, cg
-        x12 = x2.reshape(b * g, c // g, -1)
-        x21 = self.agp(x2).reshape(b * g, -1, 1).permute(0, 2, 1).softmax(dim=-1)
-        x22 = x1.reshape(b * g, c // g, -1)
-        weights = (torch.matmul(x11, x12) + torch.matmul(x21, x22)).reshape(b * g, 1, h, w)
-        out = (xg * weights.sigmoid()).reshape(b, c, h, w)
-        return out
-
-
-class RepPConvBottleneck(nn.Module):
-    """RepC2f-PConv inner bottleneck.
-
-    PConv3x3(c/n_div) -> RepDW(3,5,id) -> PW(1x1) -> gamma*out + residual.
-
-    - PConv saves ~(1 - 1/n_div) of 3x3 FLOPs vs a dense 3x3.
-    - RepDW merges 3x3 + 5x5 DW + BN-identity into a single 5x5 DW at inference.
-    - gamma initialized to 1.0 (not 1e-5) — tuned for short (~100 epoch) schedules.
-    """
-
-    def __init__(
-        self,
-        c1: int,
-        c2: int,
-        shortcut: bool = True,
-        n_div: int = 4,
-        dw_k: int = 5,
-    ):
-        """Initialize RepPConvBottleneck.
-
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels (must equal c1 for residual).
-            shortcut (bool): Use residual when c1 == c2.
-            n_div (int): PConv partial ratio (1 / n_div channels processed).
-            dw_k (int): Max RepDW kernel size (odd, >= 3).
-        """
-        super().__init__()
-        assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
-
-        self.pconv = PConv(c1, k=3, n_div=n_div, act=True)
-        self.dw_k = dw_k
-
-        # RepDW branches + BN-identity
-        for ks in range(3, dw_k + 1, 2):
-            setattr(self, f"dw_conv{ks}", Conv(c1, c1, ks, 1, ks // 2, g=c1, act=False))
-        self.dw_bn_id = nn.BatchNorm2d(c1)
-        self.dw_act = nn.SiLU(inplace=True)
-
-        # Pointwise projection
-        self.pw = Conv(c1, c2, 1, 1, act=False)
-
-        self.add = shortcut and c1 == c2
-        self.gamma = nn.Parameter(torch.ones(c2)) if self.add else None
-
-    def _rep_dw(self, x: torch.Tensor) -> torch.Tensor:
-        """Multi-branch DW during training."""
-        out = self.dw_bn_id(x)
-        for ks in range(3, self.dw_k + 1, 2):
-            out = out + getattr(self, f"dw_conv{ks}")(x)
-        return out
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Forward pass."""
-        if hasattr(self, "dw_conv"):
-            y = self.pconv(x)
-            y = self.dw_act(self.dw_conv(y))
-            y = self.pw(y)
-        else:
-            y = self.pconv(x)
-            y = self.dw_act(self._rep_dw(y))
-            y = self.pw(y)
-        if self.add:
-            y = x + y * self.gamma.view(1, -1, 1, 1) if self.gamma is not None else x + y
-        return y
-
-    @torch.no_grad()
-    def fuse_layer_scale(self):
-        """Absorb gamma into the pw conv."""
-        if self.gamma is None:
-            return
-        gamma = self.gamma.data
-        last = self.pw
-        if hasattr(last, "bn"):
-            last.conv = fuse_conv_and_bn(last.conv, last.bn)
-            delattr(last, "bn")
-            last.forward = last.forward_fuse
-        last.conv.weight.data *= gamma.view(-1, 1, 1, 1)
-        if last.conv.bias is not None:
-            last.conv.bias.data *= gamma
-        delattr(self, "gamma")
-        self.gamma = None
-
-    @torch.no_grad()
-    def _fuse_dw(self):
-        """Fuse RepDW branches + BN-identity into one DW kxk conv."""
-        k = self.dw_k
-        center = k // 2
-        ref = getattr(self, f"dw_conv{k}")
-        c = ref.conv.out_channels
-        device = ref.conv.weight.device
-        dtype = ref.conv.weight.dtype
-
-        bn = self.dw_bn_id
-        gamma_bn = bn.weight / (bn.running_var + bn.eps).sqrt()
-        w_fused = torch.zeros(c, 1, k, k, device=device, dtype=dtype)
-        b_fused = torch.zeros(c, device=device, dtype=dtype)
-        for i in range(c):
-            w_fused[i, 0, center, center] += gamma_bn[i]
-        b_fused += bn.bias - bn.running_mean * gamma_bn
-
-        for ks in range(3, k + 1, 2):
-            branch = getattr(self, f"dw_conv{ks}")
-            fused = fuse_conv_and_bn(branch.conv, branch.bn) if hasattr(branch, "bn") else branch.conv
-            pad = (k - ks) // 2
-            w_fused += F.pad(fused.weight, [pad, pad, pad, pad]) if pad else fused.weight
-            if fused.bias is not None:
-                b_fused += fused.bias
-
-        conv = nn.Conv2d(c, c, k, stride=1, padding=center, groups=c, bias=True,
-                         device=device, dtype=dtype).requires_grad_(False)
-        conv.weight.data.copy_(w_fused)
-        conv.bias.data.copy_(b_fused)
-
-        for ks in range(3, k + 1, 2):
-            delattr(self, f"dw_conv{ks}")
-        del self.dw_bn_id
-        return conv
-
-    @torch.no_grad()
-    def fuse(self):
-        """Fuse RepDW branches, PW BN, and layer scale."""
-        if hasattr(self, "dw_conv"):
-            return
-        dw_conv = self._fuse_dw()
-        if hasattr(self.pw, "bn"):
-            self.pw.conv = fuse_conv_and_bn(self.pw.conv, self.pw.bn)
-            delattr(self.pw, "bn")
-            self.pw.forward = self.pw.forward_fuse
-        self.fuse_layer_scale()
-        # fuse inner PConv BN too
-        if hasattr(self.pconv.conv, "bn"):
-            self.pconv.conv.conv = fuse_conv_and_bn(self.pconv.conv.conv, self.pconv.conv.bn)
-            delattr(self.pconv.conv, "bn")
-            self.pconv.conv.forward = self.pconv.conv.forward_fuse
-        self.dw_conv = dw_conv
-
-
-class C2fRepPConv(C2f):
-    """C2f with RepPConvBottleneck blocks and optional EMA attention.
-
-    1x1 -- split --+-- RepPConvBottleneck_1 -- ... -- RepPConvBottleneck_n [-- EMA] --+
-                   |                                                                  |-- concat -- 1x1
-                   +------------------------------------------------------------------+
-
-    When ``attn=True`` each bottleneck is followed by an EMA attention module.
-    """
-
-    def __init__(
-        self,
-        c1: int,
-        c2: int,
-        n: int = 1,
-        e: float = 0.5,
-        attn: bool = False,
-        shortcut: bool = True,
-        n_div: int = 4,
-        dw_k: int = 5,
-    ):
-        """Initialize C2fRepPConv.
-
-        Args:
-            c1 (int): Input channels.
-            c2 (int): Output channels.
-            n (int): Number of RepPConvBottleneck repeats.
-            e (float): C2f split-channel ratio.
-            attn (bool): Append EMA after each bottleneck.
-            shortcut (bool): Residual inside each bottleneck.
-            n_div (int): PConv partial ratio forwarded to the bottleneck.
-            dw_k (int): Max RepDW kernel size forwarded to the bottleneck.
-        """
-        super().__init__(c1, c2, n, shortcut, e=e)
-        # Ensure c is divisible by n_div for PConv
-        assert self.c % n_div == 0, (
-            f"C2fRepPConv hidden channels c={self.c} must be divisible by n_div={n_div}"
-        )
-        self.m = nn.ModuleList(
-            nn.Sequential(
-                RepPConvBottleneck(self.c, self.c, shortcut, n_div=n_div, dw_k=dw_k),
-                EMA(self.c),
-            )
-            if attn
-            else RepPConvBottleneck(self.c, self.c, shortcut, n_div=n_div, dw_k=dw_k)
+            else _sb()
             for _ in range(n)
         )
 

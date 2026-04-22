@@ -1,0 +1,61 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+#
+# YOLO41: yolo40 + GRN (ConvNeXt-V2) inside every StarBottleneck.
+# Changes vs yolo40:
+#   - use_grn=True added as 7th arg in every C2fStar call.
+#   - Everything else identical to yolo40.
+#
+# Rationale: GRN promotes inter-channel feature competition — the canonical
+# ConvNeXt-V2 fix for depthwise-separable feature collapse / overfitting on
+# long schedules. gamma=beta=0 init makes GRN identity at start (warmup-safe).
+# Scale-aware expectation: biggest gain on m/l/x (where DW capacity dominates);
+# on n a small regression is possible — if so, drop to yolo40 for n-scale.
+#
+# GRN is NOT fusable (input-dependent L2 norm); stays as a cheap residual layer
+# at inference. Overhead: 2 extra ops (L2 norm + channel mean) per bottleneck,
+# measured in single-digit microseconds at 640x640 / 4090.
+#
+# C2fStar args: [c2, e, attn, shortcut, uib_e, dw_k, use_grn]
+
+# Parameters
+nc: 80
+end2end: False
+reg_max: 1
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C2fStar, [256, 0.25, False, True, 6.0, 5, True]] # 2
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C2fStar, [512, 0.25, False, True, 5.0, 5, True]] # 4
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 4.0, 5, True]] # 6
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 4, C2fStar, [1024, 0.5, False, True, 4.0, 7, True]] # 8
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5, True]] # 13
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 2, C2fStar, [256, 0.5, False, True, 2.0, 7, True]] # 16
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 2, C2fStar, [512, 0.5, False, True, 2.0, 5, True]] # 19
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 2, C2fStar, [1024, 0.5, True, True, 2.0, 7, True]] # 22
+
+  - [[16, 19, 22], 1, Detect, [nc]]

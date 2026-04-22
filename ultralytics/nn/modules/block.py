@@ -1226,6 +1226,43 @@ class SEB(nn.Module):
         return x * self.fc(self.pool(x))
 
 
+class GRN(nn.Module):
+    """Global Response Normalization (ConvNeXt-V2, Woo et al. 2023).
+
+    Output = x + gamma * (x * Nx) + beta, where
+        Gx = ||x||_2 over spatial dims  (per-channel L2 norm, shape B,C,1,1)
+        Nx = Gx / (mean(Gx over channels) + eps)  (channel-wise contrast)
+
+    Promotes inter-channel feature competition (inverse of LayerNorm's role).
+    Parameter cost: 2*C. Compute cost: one L2 norm + one mean + two mul/add.
+
+    Init: gamma=beta=0 -> GRN is identity at start -> safe warmup.
+    """
+
+    def __init__(self, c: int, eps: float = 1e-6):
+        """Initialize GRN.
+
+        Args:
+            c (int): Channel count.
+            eps (float): Numerical stability for division.
+        """
+        super().__init__()
+        # 1D params (ndim=1) -> land in no-decay SGD group, not muon. Broadcast via view.
+        self.gamma = nn.Parameter(torch.zeros(c))
+        self.beta = nn.Parameter(torch.zeros(c))
+        self.eps = eps
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """Apply GRN to NCHW tensor."""
+        # Per-channel L2 norm over spatial dims: (B, C, 1, 1)
+        gx = torch.linalg.vector_norm(x, ord=2, dim=(2, 3), keepdim=True)
+        # Normalize by mean across channels
+        nx = gx / (gx.mean(dim=1, keepdim=True) + self.eps)
+        g = self.gamma.view(1, -1, 1, 1)
+        b = self.beta.view(1, -1, 1, 1)
+        return x + g * (x * nx) + b
+
+
 class StarBottleneck(nn.Module):
     """Inverted bottleneck with reparameterizable depthwise branches.
 
@@ -1237,6 +1274,8 @@ class StarBottleneck(nn.Module):
         - No layer-scale (γ): the BN inside PW-project already parameterizes output
           scale, and a separate γ_init is schedule-dependent (1e-5 for 300+ep,
           1.0 for 100ep) without representational benefit on top of BN.
+        - Optional GRN (ConvNeXt-V2) between PW-expand and PW-project promotes inter-channel
+          competition; gamma=beta=0 init makes it identity at start (safe warmup).
     """
 
     def __init__(
@@ -1246,6 +1285,7 @@ class StarBottleneck(nn.Module):
         shortcut: bool = True,
         e: float = 2.0,
         dw_k: int = 7,
+        use_grn: bool = False,
     ):
         """Initialize StarBottleneck.
 
@@ -1255,6 +1295,7 @@ class StarBottleneck(nn.Module):
             shortcut (bool): Use residual when c1 == c2.
             e (float): PW expansion ratio.
             dw_k (int): Max DW kernel size (odd, >= 3).
+            use_grn (bool): Insert GRN between PW-expand and PW-project.
         """
         super().__init__()
         assert dw_k >= 3 and dw_k % 2 == 1, f"dw_k must be odd and >= 3, got {dw_k}"
@@ -1273,6 +1314,8 @@ class StarBottleneck(nn.Module):
             Conv(c1, c_, 1, 1, act=nn.Hardswish()),
             Conv(c_, c2, 1, 1, act=False),
         )
+        # GRN (optional) sits between expand-act and project.
+        self.grn = GRN(c_) if use_grn else nn.Identity()
 
         self.add = shortcut and c1 == c2
 
@@ -1281,12 +1324,15 @@ class StarBottleneck(nn.Module):
         out = self.dw_bn_id(x)
         for ks in range(3, self.dw_k + 1, 2):
             out = out + getattr(self, f"dw_conv{ks}")(x)
-        out = self.pw(out)
+        out = self.pw[0](out)
+        out = self.grn(out)
+        out = self.pw[1](out)
         return x + out if self.add else out
 
     def forward_fuse(self, x: torch.Tensor) -> torch.Tensor:
-        """Fused inference forward using flat Conv2d ops."""
+        """Fused inference forward using flat Conv2d ops (GRN remains unfused)."""
         out = self.pw_act(self.pw1(self.dw_conv(x)))
+        out = self.grn(out)
         out = self.pw2(out)
         return x + out if self.add else out
 
@@ -1362,6 +1408,7 @@ class C2fStar(C2f):
         shortcut: bool = True,
         uib_e: float = 2.0,
         dw_k: int = 7,
+        use_grn: bool = False,
     ):
         """Initialize C2fStar.
 
@@ -1374,11 +1421,12 @@ class C2fStar(C2f):
             shortcut (bool): Residual connection inside each StarBottleneck.
             uib_e (float): PW expansion ratio forwarded to StarBottleneck.
             dw_k (int): Max DW kernel size forwarded to StarBottleneck.
+            use_grn (bool): Enable GRN (ConvNeXt-V2) inside each StarBottleneck.
         """
         super().__init__(c1, c2, n, shortcut, e=e)
 
         def _sb() -> StarBottleneck:
-            return StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k)
+            return StarBottleneck(self.c, self.c, shortcut, e=uib_e, dw_k=dw_k, use_grn=use_grn)
 
         self.m = nn.ModuleList(
             nn.Sequential(

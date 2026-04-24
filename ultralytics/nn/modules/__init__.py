@@ -105,9 +105,11 @@ from .transformer import (
     TransformerEncoderLayer,
     TransformerLayer,
 )
+from .dinov3_convnext import DINOv3ConvNeXt
 
 __all__ = (
     "AIFI",
+    "DINOv3ConvNeXt",
     "C1",
     "C2",
     "C2PSA",

@@ -310,10 +310,16 @@ class BaseTrainer:
         )
         always_freeze_names = [".dfl"]  # always freeze these layers
         freeze_layer_names = [f"model.{x}." for x in freeze_list] + always_freeze_names
-        self.freeze_layer_names = freeze_layer_names
+        # Respect modules that explicitly opt-in to being kept frozen (e.g. pretrained
+        # backbones with self._ultralytics_keep_frozen = True).
+        keep_frozen_prefixes = set()
+        for mod_name, mod in self.model.named_modules():
+            if getattr(mod, "_ultralytics_keep_frozen", False):
+                keep_frozen_prefixes.add(f"{mod_name}." if mod_name else "")
+        self.freeze_layer_names = freeze_layer_names + list(keep_frozen_prefixes)
         for k, v in self.model.named_parameters():
             # v.register_hook(lambda x: torch.nan_to_num(x))  # NaN to 0 (commented for erratic training results)
-            if any(x in k for x in freeze_layer_names):
+            if any(x in k for x in freeze_layer_names) or any(k.startswith(p) for p in keep_frozen_prefixes):
                 LOGGER.info(f"Freezing layer '{k}'")
                 v.requires_grad = False
             elif not v.requires_grad and v.dtype.is_floating_point:  # only floating point Tensor can require gradients
@@ -980,6 +986,13 @@ class BaseTrainer:
         """
         g = [{}, {}, {}, {}]  # optimizer parameter groups
         bn = tuple(v for k, v in nn.__dict__.items() if "Norm" in k)  # normalization layers, i.e. BatchNorm2d()
+        # Include custom norm layers from third-party backbones (e.g. DINOv3 ConvNeXt) so their
+        # 1D weights go into the no-decay group together with standard LN/BN.
+        try:
+            from ultralytics.nn.modules._dinov3_convnext_impl import LayerNorm as _DINOv3LayerNorm
+            bn = bn + (_DINOv3LayerNorm,)
+        except Exception:
+            pass
         if name == "auto":
             LOGGER.info(
                 f"{colorstr('optimizer:')} 'optimizer=auto' found, "
@@ -995,11 +1008,13 @@ class BaseTrainer:
         for module_name, module in unwrap_model(model).named_modules():
             for param_name, param in module.named_parameters(recurse=False):
                 fullname = f"{module_name}.{param_name}" if module_name else param_name
+                # Layer-scale 'gamma' (e.g. ConvNeXt Block) must be no-decay, not L2-regularized.
+                is_layer_scale = param_name == "gamma" and param.ndim == 1
                 if param.ndim >= 2 and use_muon:
                     g[3][fullname] = param  # muon params
                 elif "bias" in fullname:  # bias (no decay)
                     g[2][fullname] = param
-                elif isinstance(module, bn) or "logit_scale" in fullname:  # weight (no decay)
+                elif isinstance(module, bn) or is_layer_scale or "logit_scale" in fullname:  # weight (no decay)
                     # ContrastiveHead and BNContrastiveHead included here with 'logit_scale'
                     g[1][fullname] = param
                 else:  # weight (with decay)

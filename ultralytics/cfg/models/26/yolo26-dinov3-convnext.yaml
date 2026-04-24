@@ -1,0 +1,46 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO26 with DINOv3 ConvNeXt backbone (P3/8 - P5/32 outputs)
+
+# Parameters
+nc: 80
+end2end: True
+reg_max: 1
+scales:
+  # [depth, width, max_channels] -- applied only to neck/head
+  t: [0.50, 0.50, 1024]  # ConvNeXt-Tiny  (dims 96/192/384/768)
+  s: [0.50, 0.50, 1024]  # ConvNeXt-Small (dims 96/192/384/768)
+  b: [0.50, 1.00, 1024]  # ConvNeXt-Base  (dims 128/256/512/1024)
+  l: [1.00, 1.00, 1024]  # ConvNeXt-Large (dims 192/384/768/1536)
+
+# Channel sizes emitted by the DINOv3 ConvNeXt backbone at P3/P4/P5.
+# Keep these in sync with the `scales` key chosen (see ch_* anchors below).
+# For simplicity we hard-code Small here; copy the file per variant if needed.
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, DINOv3ConvNeXt, ["small", False, True]]  # 0: (P3, P4, P5)
+  - [-1, 1, Index, [192, 0]]                         # 1: P3/8   192 ch
+  - [-2, 1, Index, [384, 1]]                         # 2: P4/16  384 ch
+  - [-3, 1, Index, [768, 2]]                         # 3: P5/32  768 ch
+  - [-1, 1, SPPF, [1024, 5, 3, True]]                # 4
+  - [-1, 2, C2PSA, [1024]]                           # 5
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]]                         # cat P4
+  - [-1, 2, C3k2, [512, True]]                        # 8
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 1], 1, Concat, [1]]                         # cat P3
+  - [-1, 2, C3k2, [256, True]]                        # 11 (P3/8)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 8], 1, Concat, [1]]
+  - [-1, 2, C3k2, [512, True]]                        # 14 (P4/16)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 5], 1, Concat, [1]]
+  - [-1, 1, C3k2, [1024, True, 0.5, True]]            # 17 (P5/32)
+
+  - [[11, 14, 17], 1, Detect, [nc]]

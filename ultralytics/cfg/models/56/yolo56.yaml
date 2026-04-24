@@ -1,0 +1,54 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+#
+# YOLO56: Combo D = yolo39 + only P3 dw_k=7 (minimal single-lever test).
+# Transfers yolo46's single isolated win (knife +0.012, book +0.007 via larger
+# P3 RF) to yolo39 baseline without paying for P4 RF or wider uib_e. Cheapest
+# possible combo — same budget as yolo39.
+#
+# Delta vs yolo39:
+#   - backbone #4 P3: dw_k 5 -> 7 (single arg change)
+# All depth, uib_e, P4/P5 dw_k, head args unchanged from yolo39.
+#
+# C2fStar args: [c2, e, attn, shortcut, uib_e, dw_k]
+
+nc: 80
+end2end: False
+reg_max: 1
+scales:
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]] # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]] # 1-P2/4
+  - [-1, 2, C2fStar, [256, 0.25, False, True, 6.0, 5]] # 2
+  - [-1, 1, Conv, [256, 3, 2]] # 3-P3/8
+  - [-1, 2, C2fStar, [512, 0.25, False, True, 4.0, 7]] # 4 ← dw_k 5->7
+  - [-1, 1, Conv, [512, 3, 2]] # 5-P4/16
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.5, 5]] # 6
+  - [-1, 1, Conv, [1024, 3, 2]] # 7-P5/32
+  - [-1, 4, C2fStar, [1024, 0.5, False, True, 2.5, 7]] # 8
+  - [-1, 1, SPPF, [1024, 5, 3, True]] # 9
+  - [-1, 2, C2PSA, [1024]] # 10
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 6], 1, Concat, [1]]
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.0, 5]] # 13
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 4], 1, Concat, [1]]
+  - [-1, 4, C2fStar, [256, 0.5, False, True, 2.0, 7]] # 16
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 13], 1, Concat, [1]]
+  - [-1, 4, C2fStar, [512, 0.5, False, True, 2.0, 5]] # 19
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 10], 1, Concat, [1]]
+  - [-1, 2, C2fStar, [1024, 0.5, True, True, 2.0, 7]] # 22
+
+  - [[16, 19, 22], 1, Detect, [nc]]

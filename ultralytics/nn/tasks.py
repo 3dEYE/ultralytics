@@ -1640,7 +1640,9 @@ def parse_model(d, ch, verbose=True):
         )  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
-                with contextlib.suppress(ValueError):
+                # SyntaxError is needed for paths/URLs (e.g. "/home/x.pth") that
+                # ast.literal_eval refuses to parse.
+                with contextlib.suppress(ValueError, SyntaxError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:

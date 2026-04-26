@@ -3,14 +3,65 @@
 # This software may be used and distributed in accordance with
 # the terms of the DINOv3 License Agreement.
 #
-# Vendored verbatim from facebookresearch/dinov3 (dinov3/models/convnext.py).
-# Kept here to avoid depending on the dinov3 source tree in production.
+# Vendored from facebookresearch/dinov3 (dinov3/models/convnext.py) and trimmed
+# for use as a YOLO feature extractor. The DINO classification / SSL plumbing
+# was removed; only the ConvNeXt feature pyramid that the YOLO adapter
+# (DINOv3ConvNeXt) consumes is exposed. Kept here to avoid depending on the
+# dinov3 source tree in production.
+#
+# ---------------------------------------------------------------------------
+# Differences vs. the upstream dinov3/models/convnext.py
+# ---------------------------------------------------------------------------
+# Removed (not on the YOLO forward path; would only add latency / dead code):
+#   * ConvNeXt.forward, forward_features, forward_features_list:
+#       upstream returns a dict with x_norm_clstoken / x_norm_patchtokens /
+#       x_storage_tokens / x_prenorm built via global avg pool + flatten +
+#       cat([CLS, patches]) + final LayerNorm. YOLO needs none of that --
+#       the adapter consumes downsample_layers + stages directly and feeds
+#       NCHW feature maps to the YOLO neck.
+#   * ConvNeXt.get_intermediate_layers / _get_intermediate_layers:
+#       upstream contains an F.interpolate(..., antialias=True) that resizes
+#       feature maps to a ViT-style patch grid. For YOLO this destroys the
+#       native /4,/8,/16,/32 strides and is also a slow op on TensorRT/ORT.
+#   * Attributes head, n_blocks, n_storage_tokens, chunked_blocks,
+#     embed_dim (single), input_pad_size, patch_size:
+#       SSL/loader bookkeeping that no consumer in this repo reads.
+#   * The `masks` argument and iBOT masking branch:
+#       only meaningful during DINOv3 self-supervised pretraining.
+#
+# Kept verbatim (do NOT change -- required for strict=True checkpoint load
+# of official DINOv3 weights such as
+# dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth):
+#   * Block, LayerNorm, DropPath, drop_path:
+#       define the parameter layout encoded in the checkpoint state_dict.
+#   * ConvNeXt.downsample_layers, ConvNeXt.stages:
+#       the actual backbone weights.
+#   * ConvNeXt.norm (nn.LayerNorm on dims[-1]) AND
+#     ConvNeXt.norms = ModuleList([Id, Id, Id, self.norm]):
+#       both must remain. PyTorch's state_dict() does NOT deduplicate the
+#       aliased parameter -- the official checkpoint contains BOTH
+#       `norm.{weight,bias}` and `norms.3.{weight,bias}` keys, so dropping
+#       either attribute would break strict=True loading. They are
+#       intentionally not invoked on the YOLO forward path (the adapter
+#       takes only downsample_layers + stages).
+#   * ConvNeXt.init_weights / _init_weights:
+#       used by the adapter when pretrained=False is requested.
+#   * convnext_sizes, get_convnext_arch:
+#       the variant registry consumed by the adapter.
+#
+# Trainer integration note:
+#   ultralytics/engine/trainer.py imports the custom `LayerNorm` class from
+#   this file and adds it to its `bn` tuple so that its weights/biases land
+#   in the no-decay parameter group (alongside torch.nn norm layers and the
+#   ConvNeXt LayerScale `gamma`). Renaming or removing `LayerNorm` here
+#   would silently move those params into the L2-decayed group.
+# ---------------------------------------------------------------------------
 
 from __future__ import annotations
 
 import logging
 from functools import partial
-from typing import Dict, List, Optional, Sequence, Union
+from typing import List
 
 import numpy as np
 import torch
@@ -124,32 +175,31 @@ class LayerNorm(nn.Module):
 
 
 class ConvNeXt(nn.Module):
-    r"""
-    Code adapted from https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.pyConvNeXt
+    r"""ConvNeXt backbone trimmed for use as a YOLO feature extractor.
 
-    A PyTorch impl of : `A ConvNet for the 2020s`  -
-        https://arxiv.org/pdf/2201.03545.pdf
+    Only ``downsample_layers`` and ``stages`` participate in forward. The final
+    ``norm`` LayerNorm and the ``norms`` ModuleList are kept solely so that
+    official DINOv3 checkpoints load with ``strict=True``; they are not invoked
+    on the YOLO forward path (the :class:`DINOv3ConvNeXt` adapter consumes
+    ``downsample_layers`` and ``stages`` directly).
 
     Args:
         in_chans (int): Number of input image channels. Default: 3
-        num_classes (int): Number of classes for classification head. Default: 1000
-        depths (tuple(int)): Number of blocks at each stage. Default: [3, 3, 9, 3]
-        dims (int): Feature dimension at each stage. Default: [96, 192, 384, 768]
+        depths (List[int]): Blocks per stage. Default: [3, 3, 9, 3]
+        dims (List[int]): Feature dimension per stage. Default: [96, 192, 384, 768]
         drop_path_rate (float): Stochastic depth rate. Default: 0.
-        layer_scale_init_value (float): Init value for Layer Scale. Default: 1e-6.
-        patch_size (int | None): Pseudo patch size. Used to resize feature maps to those of a ViT with a given patch size. If None, no resizing is performed
+        layer_scale_init_value (float): LayerScale init value. Default: 1e-6.
+
+    Source: https://github.com/facebookresearch/ConvNeXt/blob/main/models/convnext.py
     """
 
     def __init__(
         self,
-        # original ConvNeXt arguments
         in_chans: int = 3,
         depths: List[int] = [3, 3, 9, 3],
         dims: List[int] = [96, 192, 384, 768],
         drop_path_rate: float = 0.0,
         layer_scale_init_value: float = 1e-6,
-        # DINO arguments
-        patch_size: int | None = None,
         **ignored_kwargs,
     ):
         super().__init__()
@@ -157,8 +207,7 @@ class ConvNeXt(nn.Module):
             logger.warning(f"Ignored kwargs: {ignored_kwargs}")
         del ignored_kwargs
 
-        # ==== ConvNeXt's original init =====
-        self.downsample_layers = nn.ModuleList()  # stem and 3 intermediate downsampling conv layers
+        self.downsample_layers = nn.ModuleList()  # stem + 3 intermediate downsamplers
         stem = nn.Sequential(
             nn.Conv2d(in_chans, dims[0], kernel_size=4, stride=4),
             LayerNorm(dims[0], eps=1e-6, data_format="channels_first"),
@@ -171,7 +220,7 @@ class ConvNeXt(nn.Module):
             )
             self.downsample_layers.append(downsample_layer)
 
-        self.stages = nn.ModuleList()  # 4 feature resolution stages, each consisting of multiple residual blocks
+        self.stages = nn.ModuleList()  # 4 feature resolution stages
         dp_rates = [x for x in np.linspace(0, drop_path_rate, sum(depths))]
         cur = 0
         for i in range(4):
@@ -184,22 +233,12 @@ class ConvNeXt(nn.Module):
             self.stages.append(stage)
             cur += depths[i]
 
-        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)  # final norm layer
-        # ==== End of ConvNeXt's original init =====
-
-        # ==== DINO adaptation ====
-        self.head = nn.Identity()  # remove classification head
-        self.embed_dim = dims[-1]
-        self.embed_dims = dims  # per layer dimensions
-        self.n_blocks = len(self.downsample_layers)  # 4
-        self.chunked_blocks = False
-        self.n_storage_tokens = 0  # no registers
-
-        self.norms = nn.ModuleList([nn.Identity() for i in range(3)])
+        # Kept for checkpoint key compatibility (norm.weight, norm.bias). Not on forward path.
+        self.norm = nn.LayerNorm(dims[-1], eps=1e-6)
+        self.norms = nn.ModuleList([nn.Identity() for _ in range(3)])
         self.norms.append(self.norm)
 
-        self.patch_size = patch_size
-        self.input_pad_size = 4  # first convolution with kernel_size = 4, stride = 4
+        self.embed_dims = dims  # per-stage dimensions, used by external feature consumers
 
     def init_weights(self):
         self.apply(self._init_weights)
@@ -218,107 +257,6 @@ class ConvNeXt(nn.Module):
             nn.init.trunc_normal_(module.weight, std=0.02)
             if module.bias is not None:
                 nn.init.zeros_(module.bias)
-
-    def forward_features(self, x: Tensor | List[Tensor], masks: Optional[Tensor] = None) -> List[Dict[str, Tensor]]:
-        if isinstance(x, torch.Tensor):
-            return self.forward_features_list([x], [masks])[0]
-        else:
-            return self.forward_features_list(x, masks)
-
-    def forward_features_list(self, x_list: List[Tensor], masks_list: List[Tensor]) -> List[Dict[str, Tensor]]:
-        output = []
-        for x, masks in zip(x_list, masks_list):
-            h, w = x.shape[-2:]
-            for i in range(4):
-                x = self.downsample_layers[i](x)
-                x = self.stages[i](x)
-            x_pool = x.mean([-2, -1])  # global average pooling, (N, C, H, W) -> (N, C)
-            x = torch.flatten(x, 2).transpose(1, 2)
-
-            # concat [CLS] and patch tokens as (N, HW + 1, C), then normalize
-            x_norm = self.norm(torch.cat([x_pool.unsqueeze(1), x], dim=1))
-            output.append(
-                {
-                    "x_norm_clstoken": x_norm[:, 0],
-                    "x_storage_tokens": x_norm[:, 1 : self.n_storage_tokens + 1],
-                    "x_norm_patchtokens": x_norm[:, self.n_storage_tokens + 1 :],
-                    "x_prenorm": x,
-                    "masks": masks,
-                }
-            )
-
-        return output
-
-    def forward(self, *args, is_training=False, **kwargs):
-        ret = self.forward_features(*args, **kwargs)
-        if is_training:
-            return ret
-        else:
-            return self.head(ret["x_norm_clstoken"])
-
-    def _get_intermediate_layers(self, x, n=1):
-        h, w = x.shape[-2:]
-        output, total_block_len = [], len(self.downsample_layers)
-        blocks_to_take = range(total_block_len - n, total_block_len) if isinstance(n, int) else n
-        for i in range(total_block_len):
-            x = self.downsample_layers[i](x)
-            x = self.stages[i](x)
-            if i in blocks_to_take:
-                x_pool = x.mean([-2, -1])
-                x_patches = x
-                if self.patch_size is not None:
-                    # Resize output feature maps to that of a ViT with given patch_size
-                    x_patches = nn.functional.interpolate(
-                        x,
-                        size=(h // self.patch_size, w // self.patch_size),
-                        mode="bilinear",
-                        antialias=True,
-                    )
-                output.append(
-                    [
-                        x_pool,  # CLS (B x C)
-                        x_patches,  # B x C x H x W
-                    ]
-                )
-        assert len(output) == len(blocks_to_take), f"only {len(output)} / {len(blocks_to_take)} blocks found"
-        return output
-
-    def get_intermediate_layers(
-        self,
-        x,
-        n: Union[int, Sequence] = 1,  # Layers or n last layers to take,
-        reshape: bool = False,
-        return_class_token: bool = False,
-        norm: bool = True,
-    ):
-        outputs = self._get_intermediate_layers(x, n)
-
-        if norm:
-            nchw_shapes = [out[-1].shape for out in outputs]
-            if isinstance(n, int):
-                norms = self.norms[-n:]
-            else:
-                norms = [self.norms[i] for i in n]
-            outputs = [
-                (
-                    norm(cls_token),  # N x C
-                    norm(patches.flatten(-2, -1).permute(0, 2, 1)),  # N x HW x C
-                )
-                for (cls_token, patches), norm in zip(outputs, norms)
-            ]
-            if reshape:
-                outputs = [
-                    (cls_token, patches.permute(0, 2, 1).reshape(*nchw).contiguous())
-                    for (cls_token, patches), nchw in zip(outputs, nchw_shapes)
-                ]
-        elif not reshape:
-            # force B x N x C format for patch tokens
-            outputs = [(cls_token, patches.flatten(-2, -1).permute(0, 2, 1)) for (cls_token, patches) in outputs]
-        class_tokens = [out[0] for out in outputs]
-        outputs = [out[1] for out in outputs]
-        if return_class_token:
-            return tuple(zip(outputs, class_tokens))
-        return tuple(outputs)
 
 
 convnext_sizes = {

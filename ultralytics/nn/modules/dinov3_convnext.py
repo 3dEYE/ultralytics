@@ -60,16 +60,23 @@ def _build_convnext(variant: str, pretrained: bool, weights: Optional[str]) -> C
 
 
 class DINOv3ConvNeXt(nn.Module):
-    """Wraps a DINOv3 ConvNeXt and yields (P3, P4, P5) tuple.
+    """Wraps a DINOv3 ConvNeXt and yields a tuple of feature maps.
 
-    YAML args: [variant, pretrained, freeze, weights]
-      variant    : "tiny" | "small" | "base" | "large"
-      pretrained : bool
-      freeze     : bool - also sets a marker the Ultralytics trainer respects
-      weights    : "LVD1689M" | "SAT493M" | local path | URL
+    YAML args: [variant, pretrained, freeze, weights, imagenet_norm, out_indices]
+      variant     : "tiny" | "small" | "base" | "large"
+      pretrained  : bool
+      freeze      : bool - also sets a marker the Ultralytics trainer respects
+      weights     : "LVD1689M" | "SAT493M" | local path | URL
+      imagenet_norm : bool
+      out_indices : tuple/list of ConvNeXt stage indices to expose.
+                    Stage 0 -> P2/4, 1 -> P3/8, 2 -> P4/16, 3 -> P5/32.
+                    Default (1, 2, 3) keeps backwards compatibility.
     """
 
-    out_indices: Tuple[int, int, int] = (1, 2, 3)  # strides 8, 16, 32
+    # Class-level defaults so checkpoints pickled before these attributes
+    # existed still load and run correctly.
+    out_indices = (1, 2, 3)
+    imagenet_norm = True
 
     def __init__(
         self,
@@ -78,11 +85,14 @@ class DINOv3ConvNeXt(nn.Module):
         freeze: bool = True,
         weights: Optional[str] = "LVD1689M",
         imagenet_norm: bool = True,
+        out_indices: Tuple[int, ...] = (1, 2, 3),
     ) -> None:
         super().__init__()
         assert variant in convnext_sizes, f"unknown variant: {variant}"
         self.variant = variant
         self.imagenet_norm = imagenet_norm
+        self.out_indices = tuple(out_indices)
+        assert all(0 <= i < 4 for i in self.out_indices), f"out_indices must be in [0, 3], got {self.out_indices}"
 
         model = _build_convnext(variant, pretrained=pretrained, weights=weights)
         self.downsample_layers = model.downsample_layers

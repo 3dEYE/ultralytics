@@ -1,0 +1,48 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO26 with DINOv3 ConvNeXt backbone (P3/8 - P5/32 outputs)
+# Backbone is fully frozen; only neck/head are trained.
+
+# Parameters
+nc: 80
+end2end: False
+reg_max: 1
+scales:
+  # [depth, width, max_channels] -- applied only to neck/head
+  n: [0.50, 0.25, 1024]
+  s: [0.50, 0.50, 1024]
+  m: [0.50, 1.00, 512]
+  l: [1.00, 1.00, 512]
+  x: [1.00, 1.50, 512]
+
+# Channel sizes emitted by the DINOv3 ConvNeXt backbone at P3/P4/P5.
+# The variant (tiny/small/base/large) is inferred from the checkpoint file --
+# point ``weights`` at a different official .pth to switch backbones.
+
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, DINOv3ConvNeXt, ["dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth", True, True, [1, 2, 3]]]  # 0: (P3, P4, P5)
+  - [-1, 1, Index, [192, 0]]                          # 1: P3/8   192 ch
+  - [-2, 1, Index, [384, 1]]                          # 2: P4/16  384 ch
+  - [-3, 1, Index, [768, 2]]                          # 3: P5/32  768 ch
+  - [-1, 1, SPPF, [1024, 5, 3, True]]                 # 4
+  - [-1, 2, C2PSA, [1024]]                            # 5
+
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]]                         # cat backbone P4
+  - [-1, 2, C3k2, [512, True]]                        # 8
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 1], 1, Concat, [1]]                         # cat backbone P3
+  - [-1, 2, C3k2, [256, True]]                        # 11 (P3/8-small)
+
+  - [-1, 1, Conv, [256, 3, 2]]
+  - [[-1, 8], 1, Concat, [1]]                         # cat head P4
+  - [-1, 2, C3k2, [512, True]]                        # 14 (P4/16-medium)
+
+  - [-1, 1, Conv, [512, 3, 2]]
+  - [[-1, 5], 1, Concat, [1]]                         # cat head P5
+  - [-1, 1, C3k2, [1024, True, 0.5, True]]            # 17 (P5/32-large)
+
+  - [[11, 14, 17], 1, Detect, [nc]]                   # Detect(P3, P4, P5)

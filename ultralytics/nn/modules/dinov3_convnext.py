@@ -7,54 +7,45 @@ so it runs on production machines without the upstream DINOv3 source tree.
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from typing import List, Tuple
 
 import torch
 import torch.nn as nn
 
-from ._dinov3_convnext_impl import ConvNeXt, convnext_sizes
+from ._dinov3_convnext_impl import ConvNeXt
 
 __all__ = ("DINOv3ConvNeXt",)
 
 
-_DINOV3_BASE_URL = "https://dl.fbaipublicfiles.com/dinov3"
+def _infer_arch_from_state_dict(state_dict: dict) -> Tuple[List[int], List[int]]:
+    """Recover ``(depths, dims)`` of a 4-stage ConvNeXt from an official DINOv3 checkpoint.
 
-# Hashes come from dinov3/hub/backbones.py (facebookresearch/dinov3).
-_WEIGHT_HASHES = {
-    "tiny":  "21b726bb",
-    "small": "296db49d",
-    "base":  "801f2ba9",
-    "large": "61fa432d",
-}
-_KNOWN_TAGS = {"LVD1689M", "SAT493M"}
+    ``dims`` come from the stem / downsample conv shapes, ``depths`` from the
+    highest block index present per stage. Avoids hard-coding a variant table.
+    """
+    # dims[0] = stem out_channels: downsample_layers.0.0.weight has shape (dims[0], in, 4, 4)
+    dims = [int(state_dict["downsample_layers.0.0.weight"].shape[0])]
+    for i in range(1, 4):
+        # downsample_layers.{i}.1.weight has shape (dims[i], dims[i-1], 2, 2)
+        dims.append(int(state_dict[f"downsample_layers.{i}.1.weight"].shape[0]))
+
+    depths = [0, 0, 0, 0]
+    for k in state_dict:
+        if k.startswith("stages.") and k.endswith(".dwconv.weight"):
+            _, stage_idx, block_idx, _, _ = k.split(".")
+            si, bi = int(stage_idx), int(block_idx)
+            if depths[si] < bi + 1:
+                depths[si] = bi + 1
+    if any(d == 0 for d in depths):
+        raise ValueError(f"Could not infer ConvNeXt depths from checkpoint, got {depths}")
+    return depths, dims
 
 
-def _official_weights_url(variant: str, tag: str) -> str:
-    arch = f"dinov3_convnext_{variant}"
-    filename = f"{arch}_pretrain_{tag.lower()}-{_WEIGHT_HASHES[variant]}.pth"
-    return f"{_DINOV3_BASE_URL}/{arch}/{filename}"
-
-
-def _load_state_dict(path_or_url: str) -> dict:
-    """Load a state_dict from HTTP(S) URL or local filesystem path."""
-    if path_or_url.startswith(("http://", "https://")):
-        return torch.hub.load_state_dict_from_url(path_or_url, map_location="cpu")
-    return torch.load(path_or_url, map_location="cpu")
-
-
-def _build_convnext(variant: str, pretrained: bool, weights: Optional[str]) -> ConvNeXt:
-    cfg = convnext_sizes[variant]
-    model = ConvNeXt(in_chans=3, depths=cfg["depths"], dims=cfg["dims"])
-    if not pretrained:
-        model.init_weights()
-        return model
-    if weights in _KNOWN_TAGS:
-        url = _official_weights_url(variant, weights)
-    elif weights is None:
-        url = _official_weights_url(variant, "LVD1689M")
-    else:
-        url = weights
-    state_dict = _load_state_dict(url)
+def _build_convnext(weights: str) -> ConvNeXt:
+    """Build a ConvNeXt whose architecture matches the given local checkpoint and load it."""
+    state_dict = torch.load(weights, map_location="cpu")
+    depths, dims = _infer_arch_from_state_dict(state_dict)
+    model = ConvNeXt(in_chans=3, depths=depths, dims=dims)
     model.load_state_dict(state_dict, strict=True)
     return model
 
@@ -62,11 +53,13 @@ def _build_convnext(variant: str, pretrained: bool, weights: Optional[str]) -> C
 class DINOv3ConvNeXt(nn.Module):
     """Wraps a DINOv3 ConvNeXt and yields a tuple of feature maps.
 
-    YAML args: [variant, pretrained, freeze, weights, imagenet_norm, out_indices]
-      variant     : "tiny" | "small" | "base" | "large"
-      pretrained  : bool
+    YAML args: [weights, freeze, imagenet_norm, out_indices]
+      weights     : local filesystem path to an official DINOv3 ConvNeXt
+                    ``*.pth`` checkpoint (e.g.
+                    ``dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth``).
+                    The variant (tiny/small/base/large) is inferred from the
+                    checkpoint -- no architecture argument is needed.
       freeze      : bool - also sets a marker the Ultralytics trainer respects
-      weights     : "LVD1689M" | "SAT493M" | local path | URL
       imagenet_norm : bool
       out_indices : tuple/list of ConvNeXt stage indices to expose.
                     Stage 0 -> P2/4, 1 -> P3/8, 2 -> P4/16, 3 -> P5/32.
@@ -80,21 +73,17 @@ class DINOv3ConvNeXt(nn.Module):
 
     def __init__(
         self,
-        variant: str = "small",
-        pretrained: bool = False,
+        weights: str,
         freeze: bool = True,
-        weights: Optional[str] = "LVD1689M",
         imagenet_norm: bool = True,
         out_indices: Tuple[int, ...] = (1, 2, 3),
     ) -> None:
         super().__init__()
-        assert variant in convnext_sizes, f"unknown variant: {variant}"
-        self.variant = variant
         self.imagenet_norm = imagenet_norm
         self.out_indices = tuple(out_indices)
         assert all(0 <= i < 4 for i in self.out_indices), f"out_indices must be in [0, 3], got {self.out_indices}"
 
-        model = _build_convnext(variant, pretrained=pretrained, weights=weights)
+        model = _build_convnext(weights)
         self.downsample_layers = model.downsample_layers
         self.stages = model.stages
 
@@ -103,7 +92,8 @@ class DINOv3ConvNeXt(nn.Module):
                 p.requires_grad_(False)
             self._ultralytics_keep_frozen = True
 
-        dims = convnext_sizes[variant]["dims"]
+        # Architecture-defining channel sizes recovered from the checkpoint.
+        dims = list(model.embed_dims)
         self._out_channels: List[int] = [dims[i] for i in self.out_indices]
 
         if imagenet_norm:

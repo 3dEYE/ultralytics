@@ -112,7 +112,11 @@ class Block(nn.Module):
     def __init__(self, dim, drop_path=0.0, layer_scale_init_value=1e-6):
         super().__init__()
         self.dwconv = nn.Conv2d(dim, dim, kernel_size=7, padding=3, groups=dim)  # depthwise conv
-        self.norm = LayerNorm(dim, eps=1e-6)
+        # Use stock nn.LayerNorm (channels_last). Same params (weight, bias of shape (dim,)),
+        # numerically identical to the previous custom LayerNorm channels_last branch
+        # (both call F.layer_norm under the hood). Cleaner ONNX export -> single LayerNormalization
+        # node with opset>=17, which TensorRT maps to INormalizationLayer.
+        self.norm = nn.LayerNorm(dim, eps=1e-6)
         self.pwconv1 = nn.Linear(dim, 4 * dim)  # pointwise/1x1 convs, implemented with linear layers
         self.act = nn.GELU()
         self.pwconv2 = nn.Linear(4 * dim, dim)
@@ -167,10 +171,12 @@ class LayerNorm(nn.Module):
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
         elif self.data_format == "channels_first":
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None, None] * x + self.bias[:, None, None]
+            # Permute to channels_last, apply F.layer_norm, permute back.
+            # This ensures ONNX export emits a single LayerNorm node that
+            # TensorRT can map to INormalizationLayer, avoiding FP16 Reduce/Pow overflow.
+            x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
+            x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+            x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
             return x
 
 

@@ -349,6 +349,11 @@ class v8DetectionLoss:
 
         self.use_dfl = m.reg_max > 1
 
+        # Class weights for handling imbalanced datasets
+        self.class_weights = getattr(model, "class_weights", None)
+        if self.class_weights is not None:
+            self.class_weights = self.class_weights.to(device).view(1, 1, -1)
+
         self.assigner = TaskAlignedAssigner(
             topk=tal_topk,
             num_classes=self.nc,
@@ -422,8 +427,11 @@ class v8DetectionLoss:
 
         target_scores_sum = max(target_scores.sum(), 1)
 
-        # Cls loss
-        loss[1] = self.bce(pred_scores, target_scores.to(dtype)).sum() / target_scores_sum  # BCE
+        # Cls loss with optional class weighting
+        bce_loss = self.bce(pred_scores, target_scores.to(dtype))  # (bs, num_anchors, nc)
+        if self.class_weights is not None:
+            bce_loss *= self.class_weights
+        loss[1] = bce_loss.sum() / target_scores_sum  # BCE
 
         # Bbox loss
         if fg_mask.sum():
@@ -870,6 +878,9 @@ class PoseLoss26(v8PoseLoss):
         Returns:
             (torch.Tensor): The RLE loss.
         """
+        if not kpt_mask.any():
+            return pred_kpt[..., :0].sum()
+
         pred_kpt_visible = pred_kpt[kpt_mask]
         gt_kpt_visible = gt_kpt[kpt_mask]
         pred_coords = pred_kpt_visible[:, 0:2]
@@ -881,11 +892,13 @@ class PoseLoss26(v8PoseLoss):
 
         pred_sigma = pred_sigma.sigmoid()
         error = (pred_coords - gt_coords) / (pred_sigma + 1e-9)
+        if not error.numel():
+            return pred_kpt[..., :0].sum()
 
         # Filter out NaN and Inf values to prevent MultivariateNormal validation errors
         valid_mask = ~(torch.isnan(error) | torch.isinf(error)).any(dim=-1)
         if not valid_mask.any():
-            return torch.tensor(0.0, device=pred_kpt.device)
+            return pred_kpt[..., :0].sum()
 
         error = error[valid_mask]
         error = error.clamp(-100, 100)  # Prevent numerical instability

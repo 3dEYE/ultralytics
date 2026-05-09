@@ -128,6 +128,7 @@ def check_file_speeds(
         std_speed = np.std(read_speeds, ddof=1) if len(read_speeds) > 1 else 0
         speed_msg = f", read: {avg_speed:.1f}±{std_speed:.1f} MB/s"
     else:
+        avg_speed = float("inf")
         speed_msg = ""
 
     if avg_ping < threshold_ms or avg_speed < threshold_mb:
@@ -398,6 +399,18 @@ def find_dataset_yaml(path: Path) -> Path:
     return files[0]
 
 
+def convert_ndjson_to_yolo_if_needed(data: str | Path) -> str | Path:
+    """Convert an NDJSON dataset or Platform dataset URI to YOLO format."""
+    data_str = str(data)
+    if data_str.endswith(".ndjson") or (data_str.startswith("ul://") and "/datasets/" in data_str):
+        import asyncio
+
+        from ultralytics.data.converter import convert_ndjson_to_yolo
+
+        return asyncio.run(convert_ndjson_to_yolo(check_file(data)))
+    return data
+
+
 def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]:
     """Download, verify, and/or unzip a dataset if not found locally.
 
@@ -412,7 +425,9 @@ def check_det_dataset(dataset: str, autodownload: bool = True) -> dict[str, Any]
     Returns:
         (dict[str, Any]): Parsed dataset information and paths.
     """
-    file = check_file(dataset)
+    file = Path(check_file(dataset))
+    if file.is_dir():
+        file = find_dataset_yaml(file)
 
     # Download (optional)
     extract_dir = ""

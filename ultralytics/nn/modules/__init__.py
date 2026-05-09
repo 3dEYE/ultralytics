@@ -106,10 +106,12 @@ from .transformer import (
     TransformerLayer,
 )
 from .dinov3_convnext import DINOv3ConvNeXt
+from .yolo26_backbone import YOLO26Backbone
 
 __all__ = (
     "AIFI",
     "DINOv3ConvNeXt",
+    "YOLO26Backbone",
     "C1",
     "C2",
     "C2PSA",

@@ -69,6 +69,7 @@ from ultralytics.nn.modules import (
     Segment26,
     TorchVision,
     WorldDetect,
+    YOLO26Backbone,
     YOLOEDetect,
     YOLOESegment,
     YOLOESegment26,
@@ -1714,9 +1715,23 @@ def parse_model(d, ch, verbose=True):
         elif m is CBFuse:
             c2 = ch[f[-1]]
         elif m in frozenset({TorchVision, Index}):
-            c2 = args[0]
             c1 = ch[f]
+            # If the upstream module emitted a feature pyramid (``ch[f]`` is a
+            # list of per-scale channel counts), pick ``c2`` from it using the
+            # ``index`` argument so scale changes don't desync the YAML.
+            if m is Index and isinstance(c1, list):
+                c2 = c1[args[1]]
+            else:
+                c2 = args[0]
             args = [*args[1:]]
+        elif m is YOLO26Backbone:
+            # Inject (c1, width, depth, max_channels, scale) ahead of any user args
+            # (e.g. ``[freeze]``) so the block scales itself like the layer-by-layer parser.
+            c1 = ch[f]
+            args = [c1, width, depth, max_channels, scale, *args]
+            c512 = make_divisible(min(512, max_channels) * width, 8)
+            c1024 = make_divisible(min(1024, max_channels) * width, 8)
+            c2 = [c512, c512, c1024]  # (P3, P4, P5) channels emitted by the block
         else:
             c2 = ch[f]
 

@@ -79,10 +79,12 @@ class LayerNorm2d(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        u = x.mean(1, keepdim=True)
-        s = (x - u).pow(2).mean(1, keepdim=True)
-        x = (x - u) / torch.sqrt(s + self.eps)
-        return self.weight[:, None, None] * x + self.bias[:, None, None]
+        # channels_first: route through F.layer_norm on the last dim so the ONNX
+        # exporter emits a single LayerNormalization node (opset>=17), which
+        # TensorRT fuses natively. Mathematically identical to the manual form.
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        return x.permute(0, 3, 1, 2)
 
 
 class GRN(nn.Module):
@@ -94,7 +96,10 @@ class GRN(nn.Module):
         self.beta = nn.Parameter(torch.zeros(1, 1, 1, dim))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        Gx = torch.norm(x, p=2, dim=(1, 2), keepdim=True)
+        # Equivalent to torch.norm(x, p=2, dim=(1, 2), keepdim=True) but exports
+        # to a small, TRT-friendly subgraph (Mul -> ReduceSum -> Sqrt) instead of
+        # the deprecated `aten::norm` op.
+        Gx = (x * x).sum(dim=(1, 2), keepdim=True).sqrt()
         Nx = Gx / (Gx.mean(dim=-1, keepdim=True) + 1e-6)
         return self.gamma * (x * Nx) + self.beta + x
 

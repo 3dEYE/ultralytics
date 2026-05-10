@@ -2521,6 +2521,7 @@ class ConvNeXtV2Backbone(nn.Module):
         LayerNorm is intentionally kept active because its output feeds the first
         block residual identity branch and is not folded by ``fuse()``.
         """
+        self._ensure_fuse_compat_state()
         if not bool(self._fused):
             return
         from ._convnextv2_impl import LayerNorm2d as _LN2d
@@ -2533,6 +2534,24 @@ class ConvNeXtV2Backbone(nn.Module):
         if isinstance(stem, nn.Sequential) and len(stem) > 1 and isinstance(stem[1], _LN2d):
             stem[1]._affine_active = True
 
+    def _ensure_fuse_compat_state(self) -> None:
+        """Create fuse-related runtime state missing from old pickled models.
+
+        PyTorch full-module checkpoints bypass ``__init__`` during ``torch.load``.
+        Models saved before the fuse machinery existed therefore lack the
+        persistent ``_fused`` buffer and ``LayerNorm2d._affine_active`` flags.
+        Treat them as unfused and install the missing attributes lazily before
+        inference-time auto-fuse touches them.
+        """
+        if "_fused" not in self._buffers:
+            device = next(self.parameters(), torch.empty(0)).device
+            self.register_buffer("_fused", torch.zeros((), dtype=torch.bool, device=device), persistent=True)
+        from ._convnextv2_impl import LayerNorm2d as _LN2d
+
+        for m in self.modules():
+            if isinstance(m, _LN2d) and not hasattr(m, "_affine_active"):
+                m._affine_active = True
+
     def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
         """Inject ``_fused=False`` for legacy checkpoints saved before this buffer existed.
 
@@ -2543,6 +2562,7 @@ class ConvNeXtV2Backbone(nn.Module):
         ``_fused=True`` flag on top of unfused weights and silently mismatch the
         runtime LN-affine flags with the actual parameters.
         """
+        self._ensure_fuse_compat_state()
         key = prefix + "_fused"
         if key not in state_dict:
             state_dict[key] = torch.zeros_like(self._fused)
@@ -2553,6 +2573,7 @@ class ConvNeXtV2Backbone(nn.Module):
     @torch.no_grad()
     def fuse(self) -> "ConvNeXtV2Backbone":
         """Fuse inference-only affine operations to simplify ONNX/TensorRT graphs."""
+        self._ensure_fuse_compat_state()
         if bool(self._fused):
             return self
         self._fuse_imagenet_norm_into_stem()

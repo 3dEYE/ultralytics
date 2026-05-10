@@ -6,6 +6,8 @@
 # Vendored verbatim from facebookresearch/dinov3 (dinov3/models/convnext.py).
 # Kept here to avoid depending on the dinov3 source tree in production.
 
+from __future__ import annotations  # PEP 604 ``X | None`` annotations on Py3.9
+
 import logging
 from functools import partial
 from typing import Dict, List, Optional, Sequence, Union

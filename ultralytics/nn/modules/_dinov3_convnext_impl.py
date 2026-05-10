@@ -72,6 +72,10 @@ class Block(nn.Module):
             else None
         )
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        # Runtime flag toggled by ``DINOv3ConvNeXt.fuse()`` after the layer-scale
+        # ``gamma`` has been folded into ``pwconv2``. ``gamma`` itself is kept
+        # (set to identity) so strict state_dict loads still work.
+        self._layer_scale_active = True
 
     def forward(self, x):
         input = x
@@ -81,7 +85,7 @@ class Block(nn.Module):
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
-        if self.gamma is not None:
+        if self.gamma is not None and self._layer_scale_active:
             x = self.gamma * x
         x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
 
@@ -107,20 +111,28 @@ class LayerNorm(nn.Module):
         if self.data_format not in ["channels_last", "channels_first"]:
             raise NotImplementedError
         self.normalized_shape = (normalized_shape,)
+        # Runtime flag toggled by ``DINOv3ConvNeXt.fuse()`` to route through
+        # ``F.layer_norm(weight=None, bias=None)`` after the affine has been
+        # folded into the following Conv/Linear. Affine parameters stay in the
+        # state_dict (set to identity) so strict checkpoint loads still work.
+        self._affine_active = True
 
     def init_weights(self):
         nn.init.ones_(self.weight)
         nn.init.zeros_(self.bias)
 
     def forward(self, x):
+        weight = self.weight if self._affine_active else None
+        bias = self.bias if self._affine_active else None
         if self.data_format == "channels_last":
-            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
-        elif self.data_format == "channels_first":
-            u = x.mean(1, keepdim=True)
-            s = (x - u).pow(2).mean(1, keepdim=True)
-            x = (x - u) / torch.sqrt(s + self.eps)
-            x = self.weight[:, None, None] * x + self.bias[:, None, None]
-            return x
+            return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+        # channels_first: route through F.layer_norm on the last dim so the ONNX
+        # exporter emits a single LayerNormalization node (opset>=17), which
+        # TensorRT fuses natively. Mathematically identical to the manual form
+        # (mean/var/scale/shift) up to fp32 reduction-order ULP noise.
+        x = x.permute(0, 2, 3, 1)
+        x = F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
+        return x.permute(0, 3, 1, 2)
 
 
 class ConvNeXt(nn.Module):

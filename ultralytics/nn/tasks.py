@@ -253,6 +253,8 @@ class BaseModel(torch.nn.Module):
                     m.forward = m.forward_fuse
                 if isinstance(m, ConvNeXtV2Backbone):
                     m.fuse()
+                if isinstance(m, DINOv3ConvNeXt):
+                    m.fuse()
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
             self.info(verbose=verbose)

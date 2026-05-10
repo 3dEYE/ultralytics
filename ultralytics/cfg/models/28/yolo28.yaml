@@ -1,0 +1,50 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLO28 object detection model with P3/8 - P5/32 outputs
+# Backbone : ConvNeXtV2 (vendored Meta impl, see ConvNeXtV2Backbone) emitting
+#            [P3, P4, P5] feature maps; the four standard variants pick channel
+#            widths automatically (atto/femto/.../tiny/.../huge).
+# Head     : GELAN FPN/PAN head taken verbatim from yolov9m.yaml (RepNCSPELAN4
+#            + AConv + SPPELAN) with channels left at the yolov9m defaults --
+#            the channel adapters inside RepNCSPELAN4 absorb the ConvNeXtV2
+#            channel counts.
+# Task docs: https://docs.ultralytics.com/tasks/detect
+
+# Parameters
+nc: 80 # number of classes
+
+# Backbone (ConvNeXtV2 wrapped as a single block, multi_scale=True -> [P3, P4, P5])
+# nano variant: dims = [80, 160, 320, 640] at strides [4, 8, 16, 32]
+#
+# Pretrained weights: download convnextv2_nano_22k_224_ema.pt once and place it
+# under weights/, or replace the path below with the official URL
+# (https://dl.fbaipublicfiles.com/convnext/convnextv2/im22k/convnextv2_nano_22k_224_ema.pt)
+# to download on first build. With freeze=True the backbone stays at its
+# pretrained representation and only the GELAN head is trained.
+backbone:
+  # [from, repeats, module, args]                                args: [variant, multi_scale, in_chans, drop_path_rate, freeze, weights, imagenet_norm]
+  - [-1, 1, ConvNeXtV2Backbone, [nano, True, 3, 0.0, True, weights/convnextv2_nano_22k_224_ema.pt]]
+  - [-1, 1, Index, [160, 0]]                                       # 1: P3/8   (160 ch)
+  - [-2, 1, Index, [320, 1]]                                       # 2: P4/16  (320 ch)
+  - [-3, 1, Index, [640, 2]]                                       # 3: P5/32  (640 ch)
+  - [-1, 1, SPPELAN, [480, 240]]                                   # 4: SPPELAN on P5 (mirrors yolov9m backbone tail)
+
+# GELAN head from yolov9m
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]] # cat backbone P4
+  - [-1, 1, RepNCSPELAN4, [360, 360, 180, 1]] # 7
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 1], 1, Concat, [1]] # cat backbone P3
+  - [-1, 1, RepNCSPELAN4, [240, 240, 120, 1]] # 10 (P3/8-small)
+
+  - [-1, 1, AConv, [180]]
+  - [[-1, 7], 1, Concat, [1]] # cat head P4
+  - [-1, 1, RepNCSPELAN4, [360, 360, 180, 1]] # 13 (P4/16-medium)
+
+  - [-1, 1, AConv, [240]]
+  - [[-1, 4], 1, Concat, [1]] # cat head P5 (SPPELAN out)
+  - [-1, 1, RepNCSPELAN4, [480, 480, 240, 1]] # 16 (P5/32-large)
+
+  - [[10, 13, 16], 1, Detect, [nc]] # Detect(P3, P4, P5)

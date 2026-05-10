@@ -51,7 +51,9 @@ __all__ = (
     "RepVGGDW",
     "ResNetLayer",
     "SCDown",
+    "ConvNeXtV2Backbone",
     "TorchVision",
+    "YOLO26Backbone",
 )
 
 
@@ -2071,3 +2073,463 @@ class RealNVP(nn.Module):
             self.float()
         z, log_det = self.backward_p(x)
         return self.prior.log_prob(z) + log_det
+
+
+class YOLO26Backbone(nn.Module):
+    """Full YOLO26 backbone (layers 0-10 of ``yolo26.yaml``) wrapped as a single block.
+
+    Reproduces the YOLO26 backbone - Conv stem, four C3k2 stages, SPPF and C2PSA -
+    as one ``nn.Module`` so it can be referenced as a single component from a YAML
+    configuration (e.g. for classification pretraining on Open Images V7 before
+    transferring weights to a detection model on COCO).
+
+    Channel and depth multipliers are applied internally to mirror what
+    ``parse_model`` does for the equivalent in-line backbone.
+
+    Attributes:
+        out_channels (int): Channels of the P5/32 output tensor.
+    """
+
+    def __init__(
+        self,
+        c1: int = 3,
+        c2: int = 1024,
+        depth: float = 1.0,
+        width: float = 1.0,
+        max_channels: int = 1024,
+        c3k_early: bool = False,
+        use_scdown: bool = False,
+        multi_scale: bool = False,
+    ):
+        """Initialize the YOLO26 backbone.
+
+        Args:
+            c1 (int): Input image channels.
+            c2 (int): Nominal P5 channel count before scaling (defaults to 1024).
+            depth (float): Depth multiplier applied to repeated blocks.
+            width (float): Width multiplier applied to channel counts.
+            max_channels (int): Upper bound on channels before width scaling.
+            c3k_early (bool): If True, force ``c3k=True`` in the two early C3k2
+                stages (matches ``m/l/x`` behaviour in ``parse_model``).
+            use_scdown (bool): If True, replace the standard ``Conv`` downsamples
+                at stages #5 (P3->P4) and #7 (P4->P5) with ``SCDown`` blocks
+                (separable-convolution downsampling, as in YOLOv10).
+            multi_scale (bool): If True, ``forward`` returns a list of
+                ``[P3, P4, P5]`` feature maps for use with an FPN-style detection
+                head (via ``Index``). If False, returns only the P5/32 tensor.
+        """
+        super().__init__()
+        from ultralytics.utils.ops import make_divisible
+
+        def _ch(n: int) -> int:
+            return make_divisible(min(n, max_channels) * width, 8)
+
+        def _rep(n: int) -> int:
+            return max(round(n * depth), 1) if n > 1 else n
+
+        c64, c128, c256, c512, c1024 = _ch(64), _ch(128), _ch(256), _ch(512), _ch(c2)
+        Down = SCDown if use_scdown else Conv
+
+        # Layers mirror yolo26.yaml backbone (indices 0-10)
+        self.stem0 = Conv(c1, c64, 3, 2)                                # 0  P1/2
+        self.stem1 = Conv(c64, c128, 3, 2)                              # 1  P2/4
+        self.c3k2_2 = C3k2(c128, c256, _rep(2), c3k_early, 0.25)        # 2
+        self.down3 = Conv(c256, c256, 3, 2)                             # 3  P3/8
+        self.c3k2_4 = C3k2(c256, c512, _rep(2), c3k_early, 0.25)        # 4
+        self.down5 = Down(c512, c512, 3, 2)                             # 5  P4/16
+        self.c3k2_6 = C3k2(c512, c512, _rep(2), True)                   # 6
+        self.down7 = Down(c512, c1024, 3, 2)                            # 7  P5/32
+        self.c3k2_8 = C3k2(c1024, c1024, _rep(2), True)                 # 8
+        self.sppf = SPPF(c1024, c1024, 5, 3, True)                      # 9
+        self.c2psa = C2PSA(c1024, c1024, _rep(2))                       # 10
+
+        self.multi_scale = multi_scale
+        self.out_channels = c1024
+        self.out_channels_p3 = c512  # P3/8 emerges after c3k2_4 (c512)
+        self.out_channels_p4 = c512
+        self.out_channels_p5 = c1024
+        # Persist constructor args so the backbone can be rebuilt from the state_dict alone.
+        self._build_args = dict(
+            c1=c1,
+            c2=c2,
+            depth=depth,
+            width=width,
+            max_channels=max_channels,
+            c3k_early=c3k_early,
+            use_scdown=use_scdown,
+            multi_scale=multi_scale,
+        )
+
+    def forward(self, x: torch.Tensor):
+        """Return the P5/32 feature map (or ``[P3, P4, P5]`` when ``multi_scale``)."""
+        x = self.stem0(x)
+        x = self.stem1(x)
+        x = self.c3k2_2(x)
+        x = self.down3(x)
+        p3 = self.c3k2_4(x)
+        x = self.down5(p3)
+        p4 = self.c3k2_6(x)
+        x = self.down7(p4)
+        x = self.c3k2_8(x)
+        x = self.sppf(x)
+        p5 = self.c2psa(x)
+        if self.multi_scale:
+            return [p3, p4, p5]
+        return p5
+
+    # Constructor keys persisted by ``export_yolo26_backbone.py`` in the ``meta`` dict.
+    _BUILD_KEYS = ("c1", "c2", "depth", "width", "max_channels", "c3k_early", "use_scdown", "multi_scale")
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        path,
+        map_location: str = "cpu",
+        strict: bool = True,
+        multi_scale: bool | None = None,
+    ) -> "YOLO26Backbone":
+        """Rebuild a ``YOLO26Backbone`` from a checkpoint written by ``export_yolo26_backbone.py``.
+
+        The expected payload is a dict of the form
+        ``{"state_dict": <sd>, "meta": {"class": "YOLO26Backbone", ...constructor args...}}``.
+
+        Args:
+            path: Path to the ``.pt`` file produced by the export script.
+            map_location: Passed through to ``torch.load``.
+            strict: Forwarded to ``load_state_dict``.
+            multi_scale: Optional override for the saved ``multi_scale`` flag (the
+                weights are identical regardless, only the forward output shape changes).
+
+        Returns:
+            YOLO26Backbone: Module with weights loaded, in ``eval`` mode.
+        """
+        from pathlib import Path as _P
+
+        ckpt = torch.load(str(_P(path)), map_location=map_location, weights_only=False)
+        if not isinstance(ckpt, dict) or "state_dict" not in ckpt or "meta" not in ckpt:
+            raise ValueError(
+                f"Checkpoint at '{path}' is not a YOLO26Backbone export "
+                f"(expected keys 'state_dict' and 'meta', got {sorted(ckpt) if isinstance(ckpt, dict) else type(ckpt).__name__})."
+            )
+        meta = dict(ckpt["meta"])
+        meta_cls = meta.pop("class", None)
+        if meta_cls != "YOLO26Backbone":
+            raise ValueError(f"Checkpoint meta['class']={meta_cls!r}, expected 'YOLO26Backbone'.")
+
+        kwargs = {k: meta[k] for k in cls._BUILD_KEYS if k in meta}
+        missing = [k for k in cls._BUILD_KEYS if k not in kwargs]
+        if missing:
+            raise ValueError(
+                f"Checkpoint meta is missing required constructor keys: {missing}. "
+                f"Re-export with the current version of export_yolo26_backbone.py."
+            )
+        if multi_scale is not None:
+            kwargs["multi_scale"] = bool(multi_scale)
+
+        model = cls(**kwargs)
+        model.load_state_dict(ckpt["state_dict"], strict=strict)
+        model.eval()
+        return model
+
+
+class ConvNeXtV2Backbone(nn.Module):
+    """ConvNeXtV2 backbone wrapped as a single Ultralytics block.
+
+    Mirrors the role of :class:`YOLO26Backbone` but uses the official
+    `ConvNeXtV2 <https://arxiv.org/abs/2301.00808>`_ stem + 4 stages. Returns
+    either the deepest ``P5/32`` feature map (suitable for a classification
+    head) or the ``[P3, P4, P5]`` triplet for an FPN-style detection head.
+
+    The internal sub-module names follow the official ConvNeXtV2 layout
+    (``downsample_layers.*`` / ``stages.*``) so Meta's pretrained checkpoints
+    can be loaded with ``strict=False`` after dropping the classifier
+    (``norm`` / ``head``) keys -- ``from_pretrained`` handles this automatically.
+
+    YAML usage (analogous to ``YOLO26Backbone``)::
+
+        # cls
+        - [-1, 1, ConvNeXtV2Backbone, [tiny]]
+        - [-1, 1, Classify, [nc]]
+
+        # detection (multi_scale=True -> emits [P3, P4, P5], pick with Index)
+        - [-1, 1, ConvNeXtV2Backbone, [tiny, True]]
+        - [-1, 1, Index, [192, 0]]   # P3
+        - [-2, 1, Index, [384, 1]]   # P4
+        - [-3, 1, Index, [768, 2]]   # P5
+
+    Args:
+        variant (str): One of ``atto / femto / pico / nano / tiny / base / large / huge``.
+        multi_scale (bool): If True, ``forward`` returns ``[P3, P4, P5]``; otherwise the P5 tensor.
+        in_chans (int): Input image channels.
+        drop_path_rate (float): Stochastic depth rate (training-only).
+        freeze (bool): If True, all backbone parameters are detached from the
+            optimizer (``requires_grad=False``) and re-frozen by the Ultralytics
+            trainer on every epoch via the ``_ultralytics_keep_frozen`` marker.
+            Useful for transfer-learning from pretrained weights.
+        weights (str, optional): Path or HTTP(S) URL to a checkpoint with
+            pretrained weights. Two flavours are auto-detected:
+
+            * Ultralytics export ``{"state_dict", "meta": {"class": "ConvNeXtV2Backbone", ...}}``
+              -- weights loaded with ``strict=True``.
+            * Official Meta ConvNeXtV2 release ``{"model": {downsample_layers...,
+              stages..., norm..., head...}}`` (or a bare state_dict) -- the
+              classifier (``norm``/``head``) is dropped, the rest is remapped
+              under ``body.*`` and loaded with ``strict=True`` after dropping.
+
+            Same loader as :meth:`from_pretrained`; ``variant`` must match the
+            file (no auto-detection for official checkpoints).
+    """
+
+    def __init__(
+        self,
+        variant: str = "tiny",
+        multi_scale: bool = False,
+        in_chans: int = 3,
+        drop_path_rate: float = 0.0,
+        freeze: bool = False,
+        weights: str | None = None,
+        imagenet_norm: bool = True,
+    ):
+        super().__init__()
+        from ._convnextv2_impl import CONVNEXTV2_VARIANTS, ConvNeXtV2Stages
+
+        if variant not in CONVNEXTV2_VARIANTS:
+            raise ValueError(
+                f"Unknown ConvNeXtV2 variant '{variant}'. Known: {sorted(CONVNEXTV2_VARIANTS)}."
+            )
+        cfg = CONVNEXTV2_VARIANTS[variant]
+        self.variant = variant
+        self.multi_scale = bool(multi_scale)
+        self.depths = list(cfg["depths"])
+        self.dims = list(cfg["dims"])
+
+        self.body = ConvNeXtV2Stages(
+            in_chans=in_chans,
+            depths=self.depths,
+            dims=self.dims,
+            drop_path_rate=drop_path_rate,
+        )
+
+        # Channel metadata (matches the YOLO26Backbone naming).
+        self.out_channels_p3 = int(self.dims[1])  # stride 8
+        self.out_channels_p4 = int(self.dims[2])  # stride 16
+        self.out_channels_p5 = int(self.dims[3])  # stride 32
+        self.out_channels = self.out_channels_p5
+
+        # ImageNet normalization (mirrors DINOv3ConvNeXt). Required when loading
+        # pretrained ConvNeXtV2 weights so inputs match the original training
+        # statistics; can be disabled if upstream pipeline already normalizes.
+        self.imagenet_norm = bool(imagenet_norm)
+        if self.imagenet_norm:
+            self.register_buffer("_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
+            self.register_buffer("_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
+
+        self._build_args = dict(
+            variant=variant,
+            multi_scale=self.multi_scale,
+            in_chans=in_chans,
+            drop_path_rate=drop_path_rate,
+            freeze=bool(freeze),
+            weights=weights,
+            imagenet_norm=self.imagenet_norm,
+        )
+
+        # Load pretrained weights BEFORE freezing so that the freeze marker is
+        # applied to the actual loaded tensors (avoids accidental re-init).
+        if weights:
+            self._load_weights(weights)
+
+        self.freeze = bool(freeze)
+        if self.freeze:
+            self.set_frozen(True)
+
+    def forward(self, x: torch.Tensor):
+        """Return ``P5`` (default) or ``[P3, P4, P5]`` when ``multi_scale``."""
+        if self.imagenet_norm:
+            x = (x - self._mean) / self._std
+        feats = self.body.forward_features(x)  # [P2, P3, P4, P5] at strides 4/8/16/32
+        if self.multi_scale:
+            return [feats[1], feats[2], feats[3]]
+        return feats[3]
+
+    def set_frozen(self, frozen: bool = True) -> "ConvNeXtV2Backbone":
+        """Freeze or unfreeze all backbone parameters.
+
+        When frozen, also sets ``_ultralytics_keep_frozen = True`` so the
+        Ultralytics trainer keeps ``requires_grad=False`` across epochs (otherwise
+        the trainer re-enables grads on previously-frozen tensors).
+        """
+        self.freeze = bool(frozen)
+        for p in self.parameters():
+            p.requires_grad_(not self.freeze)
+        if self.freeze:
+            self._ultralytics_keep_frozen = True
+        elif hasattr(self, "_ultralytics_keep_frozen"):
+            delattr(self, "_ultralytics_keep_frozen")
+        self._build_args["freeze"] = self.freeze
+        return self
+
+    def train(self, mode: bool = True):
+        """Force frozen sub-tree into eval() so BN / DropPath stay deterministic."""
+        super().train(mode)
+        if self.freeze:
+            self.body.eval()
+        return self
+
+    # ------------------------------------------------------------------ load
+    # Note: ``weights`` is intentionally excluded from BUILD_KEYS so that
+    # checkpoints exported via the Ultralytics-format payload don't try to
+    # re-download / re-load weights at instantiation time -- the saved
+    # state_dict already contains them.
+    _BUILD_KEYS = ("variant", "multi_scale", "in_chans", "drop_path_rate", "freeze", "imagenet_norm")
+
+    @staticmethod
+    def _load_state_dict_from(path_or_url: str, map_location: str = "cpu") -> dict:
+        """Load a raw state_dict from a local path or HTTP(S) URL."""
+        if path_or_url.startswith(("http://", "https://")):
+            return torch.hub.load_state_dict_from_url(path_or_url, map_location=map_location)
+        from pathlib import Path as _P
+        return torch.load(str(_P(path_or_url)), map_location=map_location, weights_only=False)
+
+    def _load_weights(self, weights: str, map_location: str = "cpu", strict: bool = True) -> None:
+        """Load pretrained weights into ``self`` from ``weights`` (path or URL).
+
+        Supports both the Ultralytics export format and the official Meta
+        ConvNeXtV2 release format. The variant in our-format checkpoints must
+        match the constructed instance.
+
+        ``strict=True`` (default) raises on any missing or unexpected keys after
+        the classifier head is dropped. Set ``strict=False`` to tolerate
+        partially-matching checkpoints (e.g. mismatched ``in_chans``); buffers
+        registered by the backbone (such as the ImageNet ``_mean`` / ``_std``)
+        are always allowed to be missing from external checkpoints.
+        """
+        ckpt = self._load_state_dict_from(weights, map_location=map_location)
+
+        # Buffers we never expect external checkpoints to carry.
+        _own_only_keys = {"_mean", "_std"} if self.imagenet_norm else set()
+
+        # --- Case 1: Ultralytics export ---------------------------------------
+        if isinstance(ckpt, dict) and "state_dict" in ckpt and "meta" in ckpt:
+            meta = dict(ckpt["meta"])
+            meta_cls = meta.pop("class", None)
+            if meta_cls != "ConvNeXtV2Backbone":
+                raise ValueError(
+                    f"weights checkpoint at '{weights}' has meta['class']={meta_cls!r}, "
+                    f"expected 'ConvNeXtV2Backbone'."
+                )
+            ckpt_variant = meta.get("variant")
+            if ckpt_variant is not None and ckpt_variant != self.variant:
+                raise ValueError(
+                    f"weights checkpoint variant '{ckpt_variant}' does not match "
+                    f"ConvNeXtV2Backbone(variant='{self.variant}')."
+                )
+            self.load_state_dict(ckpt["state_dict"], strict=strict)
+            return
+
+        # --- Case 2: official Meta ConvNeXtV2 release ------------------------
+        if isinstance(ckpt, dict) and "model" in ckpt and isinstance(ckpt["model"], dict):
+            sd = ckpt["model"]
+        elif isinstance(ckpt, dict) and "state_dict" in ckpt and isinstance(ckpt["state_dict"], dict):
+            sd = ckpt["state_dict"]
+        elif isinstance(ckpt, dict):
+            sd = ckpt
+        else:
+            raise ValueError(f"Unsupported checkpoint structure at '{weights}': {type(ckpt).__name__}")
+
+        remapped: dict[str, torch.Tensor] = {}
+        for k, v in sd.items():
+            if k.startswith(("norm.", "head.")):
+                continue  # classifier head -- not part of the backbone
+            if k.startswith(("downsample_layers.", "stages.")):
+                remapped[f"body.{k}"] = v
+            else:
+                remapped[k] = v
+
+        result = self.load_state_dict(remapped, strict=False)
+        unexpected = list(result.unexpected_keys)
+        missing = [k for k in result.missing_keys if k not in _own_only_keys]
+        if strict and unexpected:
+            raise RuntimeError(
+                f"Unexpected keys when loading ConvNeXtV2 ('{self.variant}') checkpoint "
+                f"'{weights}': {unexpected[:8]}..."
+            )
+        if strict and missing:
+            raise RuntimeError(
+                f"Missing keys when loading ConvNeXtV2 ('{self.variant}') checkpoint '{weights}' "
+                f"(maybe wrong variant?): {missing[:8]}..."
+            )
+
+    @classmethod
+    def from_pretrained(
+        cls,
+        path,
+        map_location: str = "cpu",
+        strict: bool | None = None,
+        multi_scale: bool | None = None,
+        variant: str | None = None,
+    ) -> "ConvNeXtV2Backbone":
+        """Build a ``ConvNeXtV2Backbone`` and load weights from ``path``.
+
+        Two checkpoint flavours are supported transparently:
+
+        1. **Ultralytics export** -- a dict with ``{"state_dict", "meta": {"class": "ConvNeXtV2Backbone", ...}}``
+           as produced by ``tools/export_yolo26_backbone.py`` style helpers. All
+           constructor args are restored from ``meta``; loaded with ``strict=True`` by default.
+
+        2. **Official Meta ConvNeXtV2 checkpoint** -- a dict with ``"model"``
+           (or a bare ``state_dict``) whose keys are ``downsample_layers.*`` /
+           ``stages.*`` / ``norm.*`` / ``head.*``. The classifier (``norm``/``head``)
+           keys are dropped, the rest are remapped to ``body.*`` and loaded with
+           ``strict=True``. ``variant`` must be supplied (the file does not store it).
+
+        Args:
+            path: Path or HTTP(S) URL to a ``.pt`` / ``.pth`` checkpoint.
+            map_location: Forwarded to ``torch.load``.
+            strict: Whether to raise on missing/unexpected keys (default ``True``).
+                ``None`` is treated as ``True``.
+            multi_scale: Optional override for the saved/forced ``multi_scale`` flag.
+            variant: Required when loading an official Meta checkpoint that lacks our meta block.
+
+        Returns:
+            ConvNeXtV2Backbone: Module in ``eval`` mode with weights loaded.
+        """
+        strict_flag = True if strict is None else bool(strict)
+        ckpt = cls._load_state_dict_from(str(path), map_location=map_location)
+
+        # --- Case 1: our export format ---------------------------------------
+        if isinstance(ckpt, dict) and "state_dict" in ckpt and "meta" in ckpt:
+            meta = dict(ckpt["meta"])
+            meta_cls = meta.pop("class", None)
+            if meta_cls != "ConvNeXtV2Backbone":
+                raise ValueError(f"Checkpoint meta['class']={meta_cls!r}, expected 'ConvNeXtV2Backbone'.")
+            kwargs = {k: meta[k] for k in cls._BUILD_KEYS if k in meta}
+            # Backward compat: ``imagenet_norm`` was added later; old checkpoints
+            # don't carry it, so silently fall back to the constructor default (True).
+            kwargs.setdefault("imagenet_norm", True)
+            required = tuple(k for k in cls._BUILD_KEYS if k != "imagenet_norm")
+            missing = [k for k in required if k not in kwargs]
+            if missing:
+                raise ValueError(f"Checkpoint meta is missing required constructor keys: {missing}.")
+            if multi_scale is not None:
+                kwargs["multi_scale"] = bool(multi_scale)
+            if variant is not None:
+                kwargs["variant"] = variant
+            model = cls(**kwargs)
+            model.load_state_dict(ckpt["state_dict"], strict=strict_flag)
+            model.eval()
+            return model
+
+        # --- Case 2: official Meta ConvNeXtV2 checkpoint ---------------------
+        if variant is None:
+            raise ValueError(
+                "Loading an official ConvNeXtV2 checkpoint requires `variant=` "
+                "(atto/femto/pico/nano/tiny/base/large/huge); the file itself does not encode it."
+            )
+        kwargs = {"variant": variant}
+        if multi_scale is not None:
+            kwargs["multi_scale"] = bool(multi_scale)
+        model = cls(**kwargs)  # build without weights so we can thread `strict`
+        model._load_weights(str(path), strict=strict_flag)
+        model.eval()
+        return model

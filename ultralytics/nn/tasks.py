@@ -43,6 +43,7 @@ from ultralytics.nn.modules import (
     Concat,
     Conv,
     Conv2,
+    ConvNeXtV2Backbone,
     ConvTranspose,
     Detect,
     DINOv3ConvNeXt,
@@ -69,6 +70,7 @@ from ultralytics.nn.modules import (
     Segment26,
     TorchVision,
     WorldDetect,
+    YOLO26Backbone,
     YOLOEDetect,
     YOLOESegment,
     YOLOESegment26,
@@ -1650,7 +1652,7 @@ def parse_model(d, ch, verbose=True):
         )  # get module
         for j, a in enumerate(args):
             if isinstance(a, str):
-                with contextlib.suppress(ValueError):
+                with contextlib.suppress(ValueError, SyntaxError):
                     args[j] = locals()[a] if a in locals() else ast.literal_eval(a)
         n = n_ = max(round(n * depth), 1) if n > 1 else n  # depth gain
         if m in base_modules:
@@ -1685,6 +1687,30 @@ def parse_model(d, ch, verbose=True):
                 n = 1
         elif m is ResNetLayer:
             c2 = args[1] if args[3] else args[1] * 4
+        elif m is YOLO26Backbone:
+            c1 = ch[f]
+            c2_nom = args[0] if len(args) >= 1 else 1024
+            use_scdown = bool(args[1]) if len(args) >= 2 else False
+            multi_scale = bool(args[2]) if len(args) >= 3 else False
+            c2 = make_divisible(min(c2_nom, max_channels) * width, 8)
+            c3k_early = bool(scale) and scale in "mlx"
+            args = [c1, c2_nom, depth, width, max_channels, c3k_early, use_scdown, multi_scale]
+            legacy = False
+        elif m is ConvNeXtV2Backbone:
+            # args: [variant, multi_scale?, in_chans?, drop_path_rate?, freeze?, weights?, imagenet_norm?]
+            variant = args[0] if len(args) >= 1 else "tiny"
+            multi_scale = bool(args[1]) if len(args) >= 2 else False
+            in_chans = int(args[2]) if len(args) >= 3 else ch[f]
+            drop_path_rate = float(args[3]) if len(args) >= 4 else 0.0
+            freeze = bool(args[4]) if len(args) >= 5 else False
+            weights = args[5] if len(args) >= 6 else None
+            imagenet_norm = bool(args[6]) if len(args) >= 7 else True
+            from ultralytics.nn.modules._convnextv2_impl import CONVNEXTV2_VARIANTS
+            if variant not in CONVNEXTV2_VARIANTS:
+                raise ValueError(f"Unknown ConvNeXtV2 variant '{variant}'.")
+            c2 = int(CONVNEXTV2_VARIANTS[variant]["dims"][3])  # P5 channels (no width scaling -- fixed by variant)
+            args = [variant, multi_scale, in_chans, drop_path_rate, freeze, weights, imagenet_norm]
+            legacy = False
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:
@@ -1723,6 +1749,8 @@ def parse_model(d, ch, verbose=True):
             c2 = ch[f[-1]]
         elif m in frozenset({TorchVision, Index}):
             c2 = args[0]
+            if m is Index and isinstance(f, int) and layers and isinstance(layers[f], YOLO26Backbone):
+                c2 = make_divisible(min(c2, max_channels) * width, 8)
             c1 = ch[f]
             args = [*args[1:]]
         else:

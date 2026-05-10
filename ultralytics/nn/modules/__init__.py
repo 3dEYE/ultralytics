@@ -47,6 +47,7 @@ from .block import (
     CBFuse,
     CBLinear,
     ContrastiveHead,
+    ConvNeXtV2Backbone,
     GhostBottleneck,
     HGBlock,
     HGStem,
@@ -59,6 +60,7 @@ from .block import (
     ResNetLayer,
     SCDown,
     TorchVision,
+    YOLO26Backbone,
 )
 from .conv import (
     CBAM,
@@ -146,6 +148,7 @@ __all__ = (
     "Classify",
     "Concat",
     "ContrastiveHead",
+    "ConvNeXtV2Backbone",
     "Conv",
     "Conv2",
     "ConvTranspose",
@@ -188,5 +191,6 @@ __all__ = (
     "YOLOEDetect",
     "YOLOESegment",
     "YOLOESegment26",
+    "YOLO26Backbone",
     "v10Detect",
 )

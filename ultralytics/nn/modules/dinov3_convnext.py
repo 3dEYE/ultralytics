@@ -105,14 +105,44 @@ class DINOv3ConvNeXt(nn.Module):
         # adjustments after ``load_state_dict``.
         self.register_buffer("_fused", torch.zeros((), dtype=torch.bool), persistent=True)
 
-        # Re-apply fused-state side effects after ``load_state_dict`` (incl. wrappers
-        # that recurse via ``_load_from_state_dict``). Public API in torch>=2.0,
-        # private in torch>=1.10; we accept either.
-        _register_post_hook = getattr(self, "register_load_state_dict_post_hook", None) or getattr(
+        self._register_fuse_post_hook()
+
+    def _register_fuse_post_hook(self) -> None:
+        """Re-apply fused-state side effects after ``load_state_dict``.
+
+        Public API in torch>=2.0, private in torch>=1.10; we accept either.
+        Uses a named module method (not a lambda) so the resulting ``RemovableHandle``
+        is picklable -- otherwise saving the model with ``torch.save(model)`` would
+        fail. Called from ``__init__`` and from ``__setstate__`` (so legacy
+        full-pickle checkpoints get the hook back on load).
+        """
+        register = getattr(self, "register_load_state_dict_post_hook", None) or getattr(
             self, "_register_load_state_dict_post_hook", None
         )
-        if _register_post_hook is not None:
-            _register_post_hook(lambda module, _ic: module._sync_fused_state())
+        if register is not None:
+            register(DINOv3ConvNeXt._post_load_state_dict_hook)
+
+    @staticmethod
+    def _post_load_state_dict_hook(module: "DINOv3ConvNeXt", _incompatible_keys) -> None:
+        module._sync_fused_state()
+
+    def __setstate__(self, state: dict) -> None:
+        """Restore from ``torch.save(model)`` pickles.
+
+        ``torch.load`` calls ``__setstate__`` directly (bypassing ``__init__``),
+        so the post-load hook and any lazily-installed fuse-compat attributes
+        would be missing. We re-register both here. Legacy checkpoints saved
+        before the fuse machinery existed are explicitly handled by
+        ``_ensure_fuse_compat_state``.
+        """
+        super().__setstate__(state)
+        self._ensure_fuse_compat_state()
+        self._register_fuse_post_hook()
+        # ``imagenet_norm`` is a plain Python attr (not a buffer) so legacy
+        # pickles may lack it entirely -- restore it from the presence of the
+        # ``_mean`` buffer.
+        if not hasattr(self, "imagenet_norm"):
+            self.imagenet_norm = hasattr(self, "_mean") and hasattr(self, "_std")
 
     @property
     def out_channels(self) -> List[int]:

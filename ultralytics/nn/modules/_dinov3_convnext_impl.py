@@ -85,7 +85,12 @@ class Block(nn.Module):
         x = self.pwconv1(x)
         x = self.act(x)
         x = self.pwconv2(x)
-        if self.gamma is not None and self._layer_scale_active:
+        # ``getattr`` default keeps full-pickle checkpoints saved BEFORE the
+        # fuse machinery existed working: ``torch.load`` reconstructs ``Block``
+        # via ``__setstate__`` which bypasses ``__init__`` so the flag would
+        # otherwise be missing. ``DINOv3ConvNeXt._ensure_fuse_compat_state``
+        # installs the real attribute lazily on first fuse / load_state_dict.
+        if self.gamma is not None and getattr(self, "_layer_scale_active", True):
             x = self.gamma * x
         x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
 
@@ -122,8 +127,11 @@ class LayerNorm(nn.Module):
         nn.init.zeros_(self.bias)
 
     def forward(self, x):
-        weight = self.weight if self._affine_active else None
-        bias = self.bias if self._affine_active else None
+        # ``getattr`` default keeps full-pickle checkpoints saved BEFORE the
+        # fuse machinery existed working (see ``Block.forward``).
+        active = getattr(self, "_affine_active", True)
+        weight = self.weight if active else None
+        bias = self.bias if active else None
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
         # channels_first: route through F.layer_norm on the last dim so the ONNX

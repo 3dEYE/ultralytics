@@ -80,19 +80,36 @@ class Block(nn.Module):
     def forward(self, x):
         input = x
         x = self.dwconv(x)
-        x = x.permute(0, 2, 3, 1)  # (N, C, H, W) -> (N, H, W, C)
-        x = self.norm(x)
-        x = self.pwconv1(x)
-        x = self.act(x)
-        x = self.pwconv2(x)
-        # ``getattr`` default keeps full-pickle checkpoints saved BEFORE the
-        # fuse machinery existed working: ``torch.load`` reconstructs ``Block``
-        # via ``__setstate__`` which bypasses ``__init__`` so the flag would
-        # otherwise be missing. ``DINOv3ConvNeXt._ensure_fuse_compat_state``
-        # installs the real attribute lazily on first fuse / load_state_dict.
-        if self.gamma is not None and getattr(self, "_layer_scale_active", True):
-            x = self.gamma * x
-        x = x.permute(0, 3, 1, 2)  # (N, H, W, C) -> (N, C, H, W)
+        if getattr(self, "_use_conv1x1", False):
+            # Export-friendly path: pwconv1/pwconv2 have been swapped for
+            # Conv2d(1,1) so the bulk of the block runs in NCHW. The two
+            # permutes around LN remain (LN itself is channels-last); the
+            # net effect is the same number of Transpose nodes but each
+            # ``MatMul+Add`` collapses into a single ``Conv`` ONNX node, and
+            # TRT can apply Conv-activation-Conv fusion patterns.
+            x = x.permute(0, 2, 3, 1)              # (N, C, H, W) -> (N, H, W, C)
+            x = self.norm(x)
+            x = x.permute(0, 3, 1, 2)              # (N, H, W, C) -> (N, C, H, W)
+            x = self.pwconv1(x)
+            x = self.act(x)
+            x = self.pwconv2(x)
+            if self.gamma is not None and getattr(self, "_layer_scale_active", True):
+                # gamma is per-channel -> broadcast as (1, C, 1, 1) in NCHW.
+                x = self.gamma.view(1, -1, 1, 1) * x
+        else:
+            x = x.permute(0, 2, 3, 1)              # (N, C, H, W) -> (N, H, W, C)
+            x = self.norm(x)
+            x = self.pwconv1(x)
+            x = self.act(x)
+            x = self.pwconv2(x)
+            # ``getattr`` default keeps full-pickle checkpoints saved BEFORE the
+            # fuse machinery existed working: ``torch.load`` reconstructs ``Block``
+            # via ``__setstate__`` which bypasses ``__init__`` so the flag would
+            # otherwise be missing. ``DINOv3ConvNeXt._ensure_fuse_compat_state``
+            # installs the real attribute lazily on first fuse / load_state_dict.
+            if self.gamma is not None and getattr(self, "_layer_scale_active", True):
+                x = self.gamma * x
+            x = x.permute(0, 3, 1, 2)              # (N, H, W, C) -> (N, C, H, W)
 
         x = input + self.drop_path(x)
         return x

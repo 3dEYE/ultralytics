@@ -382,3 +382,56 @@ class DINOv3ConvNeXt(nn.Module):
                 self._fuse_layer_scale_into_pwconv2(m)
         self._fused.fill_(True)
         return self
+
+    @torch.no_grad()
+    def linear_to_conv1x1(self) -> "DINOv3ConvNeXt":
+        """Replace per-block ``pwconv1``/``pwconv2`` ``Linear`` with ``Conv2d(1,1)``.
+
+        Algebraically a no-op: ``Linear(W, b)`` on the channel dim of an NHWC
+        tensor is identical to ``Conv2d(1,1)`` with ``W.view(out, in, 1, 1)``
+        applied to the equivalent NCHW tensor. The ONNX exporter however emits
+        the former as ``MatMul + Add`` (and TensorRT routes them through
+        generic GEMM tactics) while the latter becomes a single ``Conv`` node
+        that TRT happily fuses with the surrounding GELU and the residual.
+
+        Intended as an **export-time** transformation: call it once on a model
+        that has already been ``fuse()``-d, immediately before ONNX export.
+        Do not save a ``state_dict()`` after this transformation and expect a
+        clean round-trip into a freshly-built backbone: the parameter names are
+        unchanged, but ``pwconv1``/``pwconv2`` weights now have 4D Conv2d shapes
+        instead of 2D Linear shapes. Use a normal fused checkpoint for storage.
+
+        Idempotent: re-calling on already-converted blocks is a no-op.
+        """
+        self._ensure_fuse_compat_state()
+        if not bool(self._fused):
+            raise RuntimeError("linear_to_conv1x1() requires fuse() to be called first")
+        for m in self.modules():
+            if not isinstance(m, Block) or getattr(m, "_use_conv1x1", False):
+                continue
+            self._block_linear_to_conv1x1(m)
+        return self
+
+    @staticmethod
+    @torch.no_grad()
+    def _block_linear_to_conv1x1(block: "Block") -> None:
+        """Swap ``block.pwconv1`` and ``block.pwconv2`` Linear -> Conv2d(1,1) in place."""
+        for attr in ("pwconv1", "pwconv2"):
+            lin = getattr(block, attr)
+            if not isinstance(lin, nn.Linear):
+                continue
+            ref_w = lin.weight
+            conv = nn.Conv2d(
+                in_channels=lin.in_features,
+                out_channels=lin.out_features,
+                kernel_size=1,
+                bias=lin.bias is not None,
+            ).to(device=ref_w.device, dtype=ref_w.dtype)
+            conv.weight.copy_(lin.weight.detach().view(lin.out_features, lin.in_features, 1, 1))
+            if lin.bias is not None:
+                conv.bias.copy_(lin.bias.detach())
+            conv.weight.requires_grad_(lin.weight.requires_grad)
+            if conv.bias is not None:
+                conv.bias.requires_grad_(lin.bias.requires_grad)
+            setattr(block, attr, conv)
+        block._use_conv1x1 = True

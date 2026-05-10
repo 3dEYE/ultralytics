@@ -64,7 +64,14 @@ class _DropPath(nn.Module):
 # Norm / GRN
 # ----------------------------------------------------------------------------
 class LayerNorm2d(nn.Module):
-    """LayerNorm supporting both ``channels_last`` (NHWC) and ``channels_first`` (NCHW)."""
+    """LayerNorm supporting both ``channels_last`` (NHWC) and ``channels_first`` (NCHW).
+
+    ``_affine_active`` lets ``ConvNeXtV2Backbone.fuse()`` neutralize the affine pair
+    (weights are folded into the next Conv/Linear) while keeping the parameters in
+    ``state_dict``. When ``False``, ``F.layer_norm`` is called with ``weight=None,
+    bias=None`` so the ONNX exporter emits a bare LayerNormalization node that
+    TensorRT can fuse without trailing Mul/Add.
+    """
 
     def __init__(self, normalized_shape: int, eps: float = 1e-6, data_format: str = "channels_last"):
         super().__init__()
@@ -75,15 +82,18 @@ class LayerNorm2d(nn.Module):
         self.eps = eps
         self.data_format = data_format
         self.normalized_shape = (normalized_shape,)
+        self._affine_active = True
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        weight = self.weight if self._affine_active else None
+        bias = self.bias if self._affine_active else None
         if self.data_format == "channels_last":
-            return F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+            return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
         # channels_first: route through F.layer_norm on the last dim so the ONNX
         # exporter emits a single LayerNormalization node (opset>=17), which
         # TensorRT fuses natively. Mathematically identical to the manual form.
         x = x.permute(0, 2, 3, 1)
-        x = F.layer_norm(x, self.normalized_shape, self.weight, self.bias, self.eps)
+        x = F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
         return x.permute(0, 3, 1, 2)
 
 

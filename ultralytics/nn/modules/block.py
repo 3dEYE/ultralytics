@@ -2324,6 +2324,11 @@ class ConvNeXtV2Backbone(nn.Module):
             self.register_buffer("_mean", torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1))
             self.register_buffer("_std", torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1))
 
+        # Persistent fused-state marker (see ``fuse``). Stored as a buffer so it
+        # round-trips through ``state_dict`` and we can re-apply the runtime
+        # adjustments after ``load_state_dict``.
+        self.register_buffer("_fused", torch.zeros((), dtype=torch.bool), persistent=True)
+
         self._build_args = dict(
             variant=variant,
             multi_scale=self.multi_scale,
@@ -2333,6 +2338,15 @@ class ConvNeXtV2Backbone(nn.Module):
             weights=weights,
             imagenet_norm=self.imagenet_norm,
         )
+
+        # Re-apply fused-state side effects after ``load_state_dict`` (incl. wrappers
+        # that recurse via ``_load_from_state_dict``). Public API in torch>=2.0,
+        # private in torch>=1.10; we accept either.
+        _register_post_hook = getattr(self, "register_load_state_dict_post_hook", None) or getattr(
+            self, "_register_load_state_dict_post_hook", None
+        )
+        if _register_post_hook is not None:
+            _register_post_hook(lambda module, _ic: module._sync_fused_state())
 
         # Load pretrained weights BEFORE freezing so that the freeze marker is
         # applied to the actual loaded tensors (avoids accidental re-init).
@@ -2352,12 +2366,220 @@ class ConvNeXtV2Backbone(nn.Module):
             return [feats[1], feats[2], feats[3]]
         return feats[3]
 
+    @staticmethod
+    def _take_affine(norm: nn.Module, target: nn.Module):
+        """Return ``(weight, bias)`` of an active LayerNorm-like ``norm`` ready to fold into ``target``.
+
+        Returns ``None`` if there is nothing to fold (already neutralized, missing
+        params, or both are exactly identity ``(1, 0)``). The tensors are detached
+        and cast to the target weight's dtype/device so the caller can do in-place
+        arithmetic without further conversions.
+        """
+        if not getattr(norm, "_affine_active", True):
+            return None
+        weight = getattr(norm, "weight", None)
+        bias = getattr(norm, "bias", None)
+        if weight is None or bias is None:
+            return None
+        ref = target.weight
+        weight = weight.detach().to(device=ref.device, dtype=ref.dtype)
+        bias = bias.detach().to(device=ref.device, dtype=ref.dtype)
+        if torch.all(weight == 1) and torch.all(bias == 0):
+            return None
+        return weight, bias
+
+    @staticmethod
+    def _neutralize_layernorm_affine(norm: nn.Module) -> None:
+        """Set LN affine to identity ``(1, 0)`` and disable its application.
+
+        Keeps the parameters in ``state_dict`` (so ``strict=True`` loads still work)
+        but routes ``F.layer_norm`` with ``weight=None, bias=None`` for a clean
+        ONNX/TensorRT graph. See ``LayerNorm2d._affine_active``.
+        """
+        with torch.no_grad():
+            if getattr(norm, "weight", None) is not None:
+                norm.weight.fill_(1)
+                norm.weight.requires_grad_(False)
+            if getattr(norm, "bias", None) is not None:
+                norm.bias.zero_()
+                norm.bias.requires_grad_(False)
+        norm._affine_active = False
+
+    @staticmethod
+    @torch.no_grad()
+    def _fuse_layernorm_affine_into_linear(norm: nn.Module, linear: nn.Linear) -> None:
+        """Fold LayerNorm affine ``(γ, β)`` into the following ``Linear``.
+
+        For ``y = Linear(LN_affine(x)) = W · (γ ⊙ x_hat + β) + b`` the equivalent
+        affine-free form is ``W' = W ⊙ γ`` (per-input-feature scale) and
+        ``b' = b + W · β``.
+        """
+        affine = ConvNeXtV2Backbone._take_affine(norm, linear)
+        if affine is not None:
+            weight, bias = affine
+            fused_bias = linear.weight.detach().matmul(bias)
+            if linear.bias is None:
+                linear.bias = nn.Parameter(fused_bias, requires_grad=False)
+            else:
+                linear.bias.add_(fused_bias)
+            linear.weight.mul_(weight.reshape(1, -1))
+            linear.weight.requires_grad_(False)
+            linear.bias.requires_grad_(False)
+        ConvNeXtV2Backbone._neutralize_layernorm_affine(norm)
+
+    @staticmethod
+    @torch.no_grad()
+    def _fuse_layernorm_affine_into_conv(norm: nn.Module, conv: nn.Conv2d) -> None:
+        """Fold LayerNorm affine ``(γ, β)`` into the following dense ``Conv2d``.
+
+        For dense (``groups == 1``) conv, ``W' = W ⊙ γ`` (per-input-channel scale)
+        and ``b' = b + Σ_kernel(W ⊙ β)``. Grouped/depthwise conv would need a
+        per-group treatment which is not implemented here -- ConvNeXtV2 downsample
+        layers are always dense so we raise instead. ``RuntimeError`` (not ``assert``)
+        is intentional: ``python -O`` strips asserts and would otherwise let a
+        miscompiled grouped-conv silently produce wrong weights.
+        """
+        if conv.groups != 1:
+            raise RuntimeError(
+                f"LayerNorm affine fusion into grouped conv is not implemented "
+                f"(got groups={conv.groups}); refusing to corrupt weights."
+            )
+        affine = ConvNeXtV2Backbone._take_affine(norm, conv)
+        if affine is not None:
+            weight, bias = affine
+            conv_w = conv.weight.detach()
+            fused_bias = (conv_w * bias.reshape(1, -1, 1, 1)).sum(dim=(1, 2, 3))
+            if conv.bias is None:
+                conv.bias = nn.Parameter(fused_bias, requires_grad=False)
+            else:
+                conv.bias.add_(fused_bias)
+            conv.weight.mul_(weight.reshape(1, -1, 1, 1))
+            conv.weight.requires_grad_(False)
+            conv.bias.requires_grad_(False)
+        ConvNeXtV2Backbone._neutralize_layernorm_affine(norm)
+
+    @staticmethod
+    @torch.no_grad()
+    def _fuse_grn_beta_into_linear(grn: nn.Module, linear: nn.Linear) -> None:
+        """Fold the constant ``GRN.beta`` term into the following ``Linear`` bias.
+
+        GRN output contains ``... + beta`` as an additive constant in feature space,
+        which propagates through the next Linear as ``W · beta`` (added to bias).
+        """
+        if not hasattr(grn, "beta"):
+            return
+        beta = grn.beta.detach().reshape(-1).to(device=linear.weight.device, dtype=linear.weight.dtype)
+        if torch.all(beta == 0):
+            return
+        fused_bias = linear.weight.detach().matmul(beta)
+        if linear.bias is None:
+            linear.bias = nn.Parameter(fused_bias, requires_grad=False)
+        else:
+            linear.bias.add_(fused_bias)
+        linear.weight.requires_grad_(False)
+        linear.bias.requires_grad_(False)
+        grn.beta.zero_()
+        grn.beta.requires_grad_(False)
+
+    @torch.no_grad()
+    def _fuse_imagenet_norm_into_stem(self) -> None:
+        """Fold input ImageNet ``(x - mean) / std`` into the first stem ``Conv2d``.
+
+        Equivalent to ``W' = W / std`` and ``b' = b - Σ_kernel(W ⊙ mean / std)``.
+        Only valid when the conv has no zero-padding on input (otherwise the implicit
+        zero pixels would no longer correspond to the ImageNet mean after folding).
+        """
+        if not self.imagenet_norm or not hasattr(self, "_mean") or not hasattr(self, "_std"):
+            return
+        stem = self.body.downsample_layers[0]
+        conv = stem[0] if isinstance(stem, nn.Sequential) and len(stem) else None
+        if not isinstance(conv, nn.Conv2d) or conv.in_channels != self._mean.numel():
+            return
+        if any(p != 0 for p in conv.padding):
+            return  # implicit zero-pad would break the equivalence; skip silently
+
+        mean = self._mean.reshape(-1).to(device=conv.weight.device, dtype=conv.weight.dtype)
+        std = self._std.reshape(-1).to(device=conv.weight.device, dtype=conv.weight.dtype)
+        weight = conv.weight.detach().clone()
+        if conv.bias is None:
+            conv.bias = nn.Parameter(
+                torch.zeros(conv.out_channels, device=conv.weight.device, dtype=conv.weight.dtype),
+                requires_grad=False,
+            )
+        conv.weight.copy_(weight / std.reshape(1, -1, 1, 1))
+        conv.bias.sub_((weight * (mean / std).reshape(1, -1, 1, 1)).sum(dim=(1, 2, 3)))
+        conv.weight.requires_grad_(False)
+        conv.bias.requires_grad_(False)
+        self.imagenet_norm = False  # runtime flag only; ``_build_args`` is preserved
+
+    def _sync_fused_state(self) -> None:
+        """Re-apply fused-state side effects after ``load_state_dict``.
+
+        When a fused checkpoint is loaded into a freshly built instance, the
+        persistent ``_fused`` buffer comes back as ``True``. We mirror the runtime
+        flags so the eager forward matches what produced the checkpoint. The stem
+        LayerNorm is intentionally kept active because its output feeds the first
+        block residual identity branch and is not folded by ``fuse()``.
+        """
+        if not bool(self._fused):
+            return
+        from ._convnextv2_impl import LayerNorm2d as _LN2d
+
+        self.imagenet_norm = False
+        for m in self.modules():
+            if isinstance(m, _LN2d):
+                m._affine_active = False
+        stem = self.body.downsample_layers[0]
+        if isinstance(stem, nn.Sequential) and len(stem) > 1 and isinstance(stem[1], _LN2d):
+            stem[1]._affine_active = True
+
+    def _load_from_state_dict(self, state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs):
+        """Inject ``_fused=False`` for legacy checkpoints saved before this buffer existed.
+
+        Absence of ``_fused`` unambiguously means the checkpoint predates the
+        fused-state machinery, i.e. weights are unfused. We must therefore inject
+        ``False`` (not ``self._fused``) -- otherwise loading a legacy checkpoint
+        into an instance on which ``fuse()`` was already called would leave the
+        ``_fused=True`` flag on top of unfused weights and silently mismatch the
+        runtime LN-affine flags with the actual parameters.
+        """
+        key = prefix + "_fused"
+        if key not in state_dict:
+            state_dict[key] = torch.zeros_like(self._fused)
+        super()._load_from_state_dict(
+            state_dict, prefix, local_metadata, strict, missing_keys, unexpected_keys, error_msgs
+        )
+
+    @torch.no_grad()
+    def fuse(self) -> "ConvNeXtV2Backbone":
+        """Fuse inference-only affine operations to simplify ONNX/TensorRT graphs."""
+        if bool(self._fused):
+            return self
+        self._fuse_imagenet_norm_into_stem()
+        for downsample in self.body.downsample_layers[1:]:
+            if isinstance(downsample, nn.Sequential) and len(downsample) >= 2:
+                self._fuse_layernorm_affine_into_conv(downsample[0], downsample[1])
+        for m in self.body.modules():
+            if all(hasattr(m, name) for name in ("norm", "pwconv1", "grn", "pwconv2")):
+                self._fuse_layernorm_affine_into_linear(m.norm, m.pwconv1)
+                self._fuse_grn_beta_into_linear(m.grn, m.pwconv2)
+        self._fused.fill_(True)
+        return self
+
     def set_frozen(self, frozen: bool = True) -> "ConvNeXtV2Backbone":
         """Freeze or unfreeze all backbone parameters.
 
         When frozen, also sets ``_ultralytics_keep_frozen = True`` so the
         Ultralytics trainer keeps ``requires_grad=False`` across epochs (otherwise
         the trainer re-enables grads on previously-frozen tensors).
+
+        Note:
+            Calling ``set_frozen(False)`` on a model that has already been fused
+            (``self._fused == True``) is allowed but discouraged: ``fuse()``
+            collapses LN/GRN/ImageNet-norm affines into the following Conv/Linear
+            weights, so any subsequent gradient step trains the *fused* graph,
+            which is no longer mathematically equivalent to the original
+            unfused architecture. Reload an unfused checkpoint to fine-tune.
         """
         self.freeze = bool(frozen)
         for p in self.parameters():
@@ -2407,7 +2629,9 @@ class ConvNeXtV2Backbone(nn.Module):
         ckpt = self._load_state_dict_from(weights, map_location=map_location)
 
         # Buffers we never expect external checkpoints to carry.
-        _own_only_keys = {"_mean", "_std"} if self.imagenet_norm else set()
+        _own_only_keys = {"_fused"}
+        if self.imagenet_norm:
+            _own_only_keys |= {"_mean", "_std"}
 
         # --- Case 1: Ultralytics export ---------------------------------------
         if isinstance(ckpt, dict) and "state_dict" in ckpt and "meta" in ckpt:

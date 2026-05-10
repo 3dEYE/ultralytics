@@ -1,0 +1,17 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# ConvNeXtV2 image classification model wrapping the official ConvNeXtV2 backbone
+# as a single block (ConvNeXtV2Backbone). Intended for backbone pretraining /
+# fine-tuning workflows analogous to yolo27-cls.yaml.
+
+# Parameters
+nc: 1000
+
+# Backbone (full ConvNeXtV2 stem + 4 stages as a single block)
+backbone:
+  # [from, repeats, module, args]   args: [variant, multi_scale]
+  - [-1, 1, ConvNeXtV2Backbone, [tiny]]   # 0 (P5 only)
+
+# Head
+head:
+  - [-1, 1, Classify, [nc]]

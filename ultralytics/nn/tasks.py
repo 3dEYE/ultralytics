@@ -1715,6 +1715,41 @@ def parse_model(d, ch, verbose=True):
             c2 = int(CONVNEXTV2_VARIANTS[variant]["dims"][3])  # P5 channels (no width scaling -- fixed by variant)
             args = [variant, multi_scale, in_chans, drop_path_rate, freeze, weights, imagenet_norm]
             legacy = False
+        elif m is DINOv3ConvNeXt:
+            # YAML schema: [weights, pretrained, freeze, out_indices]
+            #   weights      : variant name ("tiny"/"small"/...) | local .pth | URL.
+            #                  When a path is given we infer the variant from the filename
+            #                  (e.g. ``dinov3_convnext_tiny_*.pth`` -> "tiny").
+            #   pretrained   : bool, default False.
+            #   freeze       : bool, default True.
+            #   out_indices  : per-stage selector for the multi-scale tuple, default (1, 2, 3).
+            from ultralytics.nn.modules._dinov3_convnext_impl import convnext_sizes
+            weights = args[0] if len(args) >= 1 else "LVD1689M"
+            pretrained = bool(args[1]) if len(args) >= 2 else False
+            freeze = bool(args[2]) if len(args) >= 3 else True
+            out_indices = tuple(args[3]) if len(args) >= 4 and args[3] is not None else (1, 2, 3)
+            if out_indices != DINOv3ConvNeXt.out_indices:
+                raise NotImplementedError(
+                    f"DINOv3ConvNeXt out_indices override not supported (got {out_indices}, "
+                    f"expected {DINOv3ConvNeXt.out_indices})"
+                )
+            if isinstance(weights, str) and weights in convnext_sizes:
+                variant = weights
+                weights_arg = "LVD1689M"
+            else:
+                variant = "tiny"
+                if isinstance(weights, str):
+                    for v in convnext_sizes:
+                        if f"convnext_{v}" in weights:
+                            variant = v
+                            break
+                weights_arg = weights
+            dims = convnext_sizes[variant]["dims"]
+            c2 = [dims[i] for i in out_indices]  # multi-scale output channel list
+            args = [variant, pretrained, freeze, weights_arg, True]
+            # Stamp ``out_indices`` on the produced module after construction.
+            _dinov3_out_indices = out_indices
+            legacy = False
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]
         elif m is Concat:

@@ -2686,10 +2686,16 @@ class ConvNeXtV2Backbone(nn.Module):
         for k, v in sd.items():
             if k.startswith(("norm.", "head.")):
                 continue  # classifier head -- not part of the backbone
-            if k.startswith(("downsample_layers.", "stages.")):
-                remapped[f"body.{k}"] = v
-            else:
-                remapped[k] = v
+            new_key = f"body.{k}" if k.startswith(("downsample_layers.", "stages.")) else k
+            # Older Meta ConvNeXtV2 releases (e.g. ``convnextv2_nano_1k_224_fcmae.pt``)
+            # store GRN ``gamma``/``beta`` as ``(1, dim)``; later releases and our
+            # implementation use ``(1, 1, 1, dim)``. The broadcast semantics are
+            # identical because GRN runs in NHWC -- normalise the on-disk shape
+            # so ``load_state_dict`` does not raise on shape mismatch.
+            if new_key.endswith(".grn.gamma") or new_key.endswith(".grn.beta"):
+                if v.dim() == 2 and v.shape[0] == 1:
+                    v = v.view(1, 1, 1, v.shape[1])
+            remapped[new_key] = v
 
         result = self.load_state_dict(remapped, strict=False)
         unexpected = list(result.unexpected_keys)

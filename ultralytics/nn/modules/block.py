@@ -2346,7 +2346,7 @@ class ConvNeXtV2Backbone(nn.Module):
             self, "_register_load_state_dict_post_hook", None
         )
         if _register_post_hook is not None:
-            _register_post_hook(lambda module, _ic: module._sync_fused_state())
+            _register_post_hook(ConvNeXtV2Backbone._post_load_sync_fused_state)
 
         # Load pretrained weights BEFORE freezing so that the freeze marker is
         # applied to the actual loaded tensors (avoids accidental re-init).
@@ -2511,6 +2511,15 @@ class ConvNeXtV2Backbone(nn.Module):
         conv.weight.requires_grad_(False)
         conv.bias.requires_grad_(False)
         self.imagenet_norm = False  # runtime flag only; ``_build_args`` is preserved
+
+    @staticmethod
+    def _post_load_sync_fused_state(module: "ConvNeXtV2Backbone", _incompatible_keys) -> None:
+        """Picklable post-``load_state_dict`` hook delegating to ``_sync_fused_state``.
+
+        Defined as a real method (not a closure / lambda) so that ``torch.save``
+        of a module carrying this hook can pickle it.
+        """
+        module._sync_fused_state()
 
     def _sync_fused_state(self) -> None:
         """Re-apply fused-state side effects after ``load_state_dict``.

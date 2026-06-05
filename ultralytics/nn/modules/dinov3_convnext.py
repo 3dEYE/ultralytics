@@ -412,6 +412,26 @@ class DINOv3ConvNeXt(nn.Module):
             self._block_linear_to_conv1x1(m)
         return self
 
+    @torch.no_grad()
+    def fuse_for_export(self) -> "DINOv3ConvNeXt":
+        """One-shot export preparation: do all the graph-simplification magic.
+
+        Equivalent to ``self.fuse().linear_to_conv1x1()`` behind a single explicit
+        call. Folds ImageNet norm into the stem, LayerNorm affine into the
+        following conv/linear, and layer-scale ``gamma`` into ``pwconv2``; then
+        swaps the pointwise ``Linear`` layers for ``Conv2d(1, 1)`` so TensorRT
+        emits a single ``Conv`` per pointwise op and fuses Conv-GELU-Conv.
+
+        Unlike :meth:`fuse` (which is storage-safe), this MUTATES parameter shapes
+        (``pwconv1``/``pwconv2`` become 4D ``Conv2d`` weights), so the result is
+        export-only: do not save a ``state_dict`` afterwards and expect a clean
+        round-trip into a freshly built backbone. Idempotent: re-calling is a
+        no-op.
+        """
+        self.fuse()
+        self.linear_to_conv1x1()
+        return self
+
     @staticmethod
     @torch.no_grad()
     def _block_linear_to_conv1x1(block: "Block") -> None:

@@ -1,0 +1,38 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLOv9m GELAN head with DINOv3 ViT + STA backbone (P3/8 - P5/32 outputs)
+# Backbone is frozen by default; train STA + neck/head first.
+
+# Parameters
+nc: 80 # number of classes
+end2end: False
+
+# DINOv3 ViT + Spatial Tuning Adapter backbone.
+# args: [arch, pretrained, freeze, weights, interaction_indexes, [P3, P4, P5], detail_channels, imagenet_norm]
+backbone:
+  # [from, repeats, module, args]
+  - [-1, 1, DINOv3ViTSTA, [vitb16, True, True, "dinov3_vits16_pretrain_lvd1689m-08c60483.pth", [5, 8, 11], [192, 384, 768], 96, True]] # 0: (P3, P4, P5)
+  - [-1, 1, Index, [192, 0]]    # 1: P3/8
+  - [-2, 1, Index, [384, 1]]    # 2: P4/16
+  - [-3, 1, Index, [768, 2]]    # 3: P5/32
+  - [-1, 1, SPPELAN, [256, 128]] # 4
+
+# GELAN head (M-scale)
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 2], 1, Concat, [1]]                  # cat backbone P4
+  - [-1, 1, RepNCSPELAN4, [192, 192, 96, 1]]   # 7
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]
+  - [[-1, 1], 1, Concat, [1]]                  # cat backbone P3
+  - [-1, 1, RepNCSPELAN4, [128, 128, 64, 1]]   # 10 (P3/8-small)
+
+  - [-1, 1, AConv, [96]]
+  - [[-1, 7], 1, Concat, [1]]                  # cat head P4
+  - [-1, 1, RepNCSPELAN4, [192, 192, 96, 1]]   # 13 (P4/16-medium)
+
+  - [-1, 1, AConv, [128]]
+  - [[-1, 4], 1, Concat, [1]]                  # cat head P5
+  - [-1, 1, RepNCSPELAN4, [256, 256, 128, 1]]  # 16 (P5/32-large)
+
+  - [[10, 13, 16], 1, Detect, [nc]]            # Detect(P3, P4, P5)

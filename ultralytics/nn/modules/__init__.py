@@ -108,10 +108,12 @@ from .transformer import (
     TransformerLayer,
 )
 from .dinov3_convnext import DINOv3ConvNeXt
+from .dinov3_vit_sta import DINOv3ViTSTA
 
 __all__ = (
     "AIFI",
     "DINOv3ConvNeXt",
+    "DINOv3ViTSTA",
     "C1",
     "C2",
     "C2PSA",

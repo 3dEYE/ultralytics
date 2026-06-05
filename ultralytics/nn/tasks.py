@@ -47,6 +47,7 @@ from ultralytics.nn.modules import (
     ConvTranspose,
     Detect,
     DINOv3ConvNeXt,
+    DINOv3ViTSTA,
     DWConv,
     DWConvTranspose2d,
     Focus,
@@ -254,6 +255,8 @@ class BaseModel(torch.nn.Module):
                 if isinstance(m, ConvNeXtV2Backbone):
                     m.fuse()
                 if isinstance(m, DINOv3ConvNeXt):
+                    m.fuse()
+                if isinstance(m, DINOv3ViTSTA):
                     m.fuse()
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
@@ -1749,6 +1752,23 @@ def parse_model(d, ch, verbose=True):
             args = [variant, pretrained, freeze, weights_arg, True]
             # Stamp ``out_indices`` on the produced module after construction.
             _dinov3_out_indices = out_indices
+            legacy = False
+        elif m is DINOv3ViTSTA:
+            # YAML schema: [arch, pretrained, freeze, weights, interaction_indexes, out_channels, detail_channels, imagenet_norm]
+            arch = args[0] if len(args) >= 1 else "vitb16"
+            pretrained = bool(args[1]) if len(args) >= 2 else True
+            freeze = bool(args[2]) if len(args) >= 3 else True
+            weights = args[3] if len(args) >= 4 else None
+            interaction_indexes = args[4] if len(args) >= 5 else None
+            out_channels = args[5] if len(args) >= 6 and args[5] is not None else [192, 384, 768]
+            detail_channels = int(args[6]) if len(args) >= 7 else 96
+            imagenet_norm = bool(args[7]) if len(args) >= 8 else True
+            if not isinstance(out_channels, (list, tuple)) or len(out_channels) != 3:
+                raise ValueError(
+                    f"DINOv3ViTSTA expects out_channels=[P3,P4,P5], got: {out_channels!r}"
+                )
+            c2 = [int(out_channels[0]), int(out_channels[1]), int(out_channels[2])]
+            args = [arch, pretrained, freeze, weights, interaction_indexes, c2, detail_channels, imagenet_norm]
             legacy = False
         elif m is torch.nn.BatchNorm2d:
             args = [ch[f]]

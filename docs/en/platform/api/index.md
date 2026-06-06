@@ -286,7 +286,7 @@ POST /api/datasets
 
 !!! note "Supported Tasks"
 
-    Valid `task` values: `detect`, `segment`, `classify`, `pose`, `obb`.
+    Valid `task` values: `detect`, `segment`, `semantic`, `classify`, `pose`, `obb`.
 
 ### Update Dataset
 
@@ -505,7 +505,7 @@ Run YOLO inference on dataset images to auto-generate annotations. Uses a select
 | `imageHash`  | string | Yes      | Hash of the image to annotate        |
 | `modelId`    | string | No       | Model ID to use for inference        |
 | `confidence` | float  | No       | Confidence threshold (default: 0.25) |
-| `iou`        | float  | No       | IoU threshold (default: 0.45)        |
+| `iou`        | float  | No       | IoU threshold (default: 0.7)         |
 
 ### Dataset Ingest
 
@@ -739,13 +739,13 @@ POST /api/models
 
 **JSON Body:**
 
-| Field         | Type   | Required | Description                                      |
-| ------------- | ------ | -------- | ------------------------------------------------ |
-| `projectId`   | string | Yes      | Target project ID                                |
-| `slug`        | string | No       | URL slug (lowercase alphanumeric/hyphens)        |
-| `name`        | string | No       | Display name (max 100 chars)                     |
-| `description` | string | No       | Model description (max 1000 chars)               |
-| `task`        | string | No       | Task type (detect, segment, pose, obb, classify) |
+| Field         | Type   | Required | Description                                                |
+| ------------- | ------ | -------- | ---------------------------------------------------------- |
+| `projectId`   | string | Yes      | Target project ID                                          |
+| `slug`        | string | No       | URL slug (lowercase alphanumeric/hyphens)                  |
+| `name`        | string | No       | Display name (max 100 chars)                               |
+| `description` | string | No       | Model description (max 1000 chars)                         |
+| `task`        | string | No       | Task type (detect, segment, semantic, pose, obb, classify) |
 
 !!! note "Model File Upload"
 
@@ -890,7 +890,7 @@ POST /api/models/{modelId}/predict/warmup
 
 ## Training API
 
-Launch YOLO training on cloud GPUs (23 GPU types from RTX 2000 Ada to B200) and monitor progress in real time. See [Cloud Training documentation](../train/cloud-training.md).
+Launch YOLO training on cloud GPUs (24 GPU types from RTX 2000 Ada to B300) and monitor progress in real time. See [Cloud Training documentation](../train/cloud-training.md).
 
 ```mermaid
 graph LR
@@ -952,7 +952,7 @@ POST /api/training/start
 
 !!! note "GPU Types"
 
-    Available GPU types include `rtx-4090`, `a100-80gb-pcie`, `a100-80gb-sxm`, `h100-sxm`, `rtx-pro-6000`, and others. See [Cloud Training](../train/cloud-training.md) for the full list with pricing.
+    Available GPU types include `rtx-4090`, `a100-80gb-pcie`, `a100-80gb-sxm`, `h100-sxm`, `rtx-pro-6000`, `b300`, and others. See [Cloud Training](../train/cloud-training.md) for the full list with pricing.
 
 ### Get Training Status
 
@@ -1217,9 +1217,11 @@ POST /api/exports
 | TF.js         | `tfjs`        | Browser inference        |
 | MNN           | `mnn`         | Alibaba mobile inference |
 | RKNN          | `rknn`        | Rockchip NPU             |
+| Qualcomm      | `qnn`         | Qualcomm Snapdragon NPU  |
 | IMX           | `imx`         | Sony IMX500 sensor       |
 | Axelera       | `axelera`     | Axelera AI accelerators  |
 | ExecuTorch    | `executorch`  | Meta ExecuTorch runtime  |
+| DeepX         | `deepx`       | DeepX NPU accelerators   |
 
 ### Get Export Status
 
@@ -2055,7 +2057,7 @@ yolo check
 
 !!! warning "Package Version Requirement"
 
-    Platform integration requires **ultralytics>=8.4.35**. Lower versions will NOT work with Platform.
+    Platform integration requires **ultralytics>=8.4.60**. Lower versions will NOT work with Platform.
 
 ### Authentication
 

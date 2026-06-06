@@ -19,7 +19,7 @@ GITHUB_ASSETS_NAMES = frozenset(
     [f"yolov8{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-pose", "-obb", "-oiv7")]
     + [f"yolo11{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-pose", "-obb")]
     + [f"yolo12{k}{suffix}.pt" for k in "nsmlx" for suffix in ("",)]  # detect models only currently
-    + [f"yolo26{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-pose", "-obb")]
+    + [f"yolo26{k}{suffix}.pt" for k in "nsmlx" for suffix in ("", "-cls", "-seg", "-sem", "-pose", "-obb")]
     + [f"yolov5{k}{resolution}u.pt" for k in "nsmlx" for resolution in ("", "6")]
     + [f"yolov3{k}u.pt" for k in ("", "-spp", "-tiny")]
     + [f"yolov8{k}-world.pt" for k in "smlx"]
@@ -495,7 +495,7 @@ def attempt_download_asset(
         download_url = f"https://github.com/{repo}/releases/download"
         if str(file).startswith(("http:/", "https:/")):  # download
             url = str(file).replace(":/", "://")  # Pathlib turns :// -> :/
-            file = url2file(name)  # parse authentication https://url.com/file.txt?auth...
+            file = url2file(name)  # parse authentication query strings
             if Path(file).is_file():
                 LOGGER.info(f"Found {clean_url(url)} locally at {file}")  # file already exists
             else:
@@ -539,7 +539,7 @@ def download(
         exist_ok (bool, optional): Whether to overwrite existing contents during unzipping.
 
     Examples:
-        >>> download("https://ultralytics.com/assets/example.zip", dir="path/to/dir", unzip=True)
+        >>> download("https://github.com/ultralytics/assets/releases/download/v0.0.0/bus.jpg", dir="path/to/dir")
     """
     dir = Path(dir)
     dir.mkdir(parents=True, exist_ok=True)  # make directory

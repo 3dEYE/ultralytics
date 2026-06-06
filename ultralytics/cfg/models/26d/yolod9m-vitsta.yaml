@@ -11,7 +11,7 @@ end2end: False
 # args: [arch, pretrained, freeze, weights, interaction_indexes, [P3, P4, P5], detail_channels, imagenet_norm]
 backbone:
   # [from, repeats, module, args]
-  - [-1, 1, DINOv3ViTSTA, [vitb16, True, True, "dinov3_vits16_pretrain_lvd1689m-08c60483.pth", [5, 8, 11], [192, 384, 768], 96, True]] # 0: (P3, P4, P5)
+  - [-1, 1, DINOv3ViTSTA, [vits16, True, True, "dinov3_vits16_pretrain_lvd1689m-08c60483.pth", [5, 8, 11], [192, 384, 768], 96, True]] # 0: (P3, P4, P5)
   - [-1, 1, Index, [192, 0]]    # 1: P3/8
   - [-2, 1, Index, [384, 1]]    # 2: P4/16
   - [-3, 1, Index, [768, 2]]    # 3: P5/32

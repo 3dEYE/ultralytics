@@ -73,6 +73,54 @@ def test_model_methods():
     _ = model.task_map
 
 
+def test_model_fuse_calls_dinov3_backbone_fuse(monkeypatch):
+    """Smoke-test that BaseModel.fuse() dispatches into DINOv3ConvNeXt.fuse()."""
+    from ultralytics.nn.modules import DINOv3ConvNeXt
+    from ultralytics.nn.tasks import BaseModel
+
+    class DummyFuseModel(BaseModel):
+        def __init__(self, backbone):
+            super().__init__()
+            self.model = torch.nn.Sequential(backbone)
+
+    backbone = DINOv3ConvNeXt(variant="tiny", pretrained=False, freeze=True)
+    model = DummyFuseModel(backbone)
+    calls = {"count": 0}
+    original_fuse = backbone.fuse
+
+    def counting_fuse():
+        calls["count"] += 1
+        return original_fuse()
+
+    monkeypatch.setattr(backbone, "fuse", counting_fuse)
+    model.fuse(verbose=False)
+    assert calls["count"] == 1, "Expected BaseModel.fuse() to call DINOv3ConvNeXt.fuse() exactly once"
+
+
+def test_dinov3_convnext_fuse_no_degradation():
+    """Verify DINOv3ConvNeXt features stay numerically close after fuse()."""
+    from ultralytics.nn.modules import DINOv3ConvNeXt
+
+    torch.manual_seed(0)
+    model = DINOv3ConvNeXt(variant="tiny", pretrained=False, freeze=True).eval()
+    x = torch.rand(1, 3, 160, 160)
+
+    with torch.no_grad():
+        y_before = model(x)
+        model.fuse()
+        y_after = model(x)
+
+    assert len(y_before) == len(y_after), "Feature pyramid length changed after fuse()"
+    for i, (a, b) in enumerate(zip(y_before, y_after)):
+        torch.testing.assert_close(
+            a,
+            b,
+            rtol=1e-4,
+            atol=1e-5,
+            msg=f"Feature map P{i + 3} diverged after fuse()",
+        )
+
+
 def test_model_profile():
     """Test profiling of the YOLO model with `profile=True` to assess performance and resource usage."""
     from ultralytics.nn.tasks import DetectionModel

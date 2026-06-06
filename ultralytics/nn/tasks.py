@@ -236,6 +236,7 @@ class BaseModel(torch.nn.Module):
         Returns:
             (torch.nn.Module): The fused model is returned.
         """
+        did_fuse = False
         if not self.is_fused():
             for m in self.model.modules():
                 if isinstance(m, (Conv, Conv2, DWConv)) and hasattr(m, "bn"):
@@ -244,24 +245,47 @@ class BaseModel(torch.nn.Module):
                     m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
                     delattr(m, "bn")  # remove batchnorm
                     m.forward = m.forward_fuse  # update forward
+                    did_fuse = True
                 if isinstance(m, ConvTranspose) and hasattr(m, "bn"):
                     m.conv_transpose = fuse_deconv_and_bn(m.conv_transpose, m.bn)
                     delattr(m, "bn")  # remove batchnorm
                     m.forward = m.forward_fuse  # update forward
+                    did_fuse = True
                 if isinstance(m, RepConv):
                     m.fuse_convs()
                     m.forward = m.forward_fuse  # update forward
+                    did_fuse = True
                 if isinstance(m, RepVGGDW):
                     m.fuse()
                     m.forward = m.forward_fuse
-                if isinstance(m, ConvNeXtV2Backbone):
-                    m.fuse()
-                if isinstance(m, DINOv3ConvNeXt):
-                    m.fuse()
-                if isinstance(m, DINOv3ViTSTA):
-                    m.fuse()
+                    did_fuse = True
                 if isinstance(m, Detect) and getattr(m, "end2end", False):
                     m.fuse()  # remove one2many head
+                    did_fuse = True
+
+        # Run custom backbone fusion regardless of is_fused() heuristic.
+        # These modules may use custom norm layers not counted by BaseModel.is_fused().
+        for m in self.model.modules():
+            if isinstance(m, ConvNeXtV2Backbone):
+                m.fuse()
+                did_fuse = True
+            if isinstance(m, DINOv3ConvNeXt):
+                m.fuse()
+                did_fuse = True
+            if isinstance(m, DINOv3ViTSTA):
+                m.fuse()
+                did_fuse = True
+            # Fallback for checkpoints/modules loaded from a different import path
+            # where class identity differs and isinstance() checks may fail.
+            if (
+                hasattr(m, "fuse")
+                and m.__class__.__name__ in {"ConvNeXtV2Backbone", "DINOv3ConvNeXt", "DINOv3ViTSTA"}
+                and not isinstance(m, (ConvNeXtV2Backbone, DINOv3ConvNeXt, DINOv3ViTSTA))
+            ):
+                m.fuse()
+                did_fuse = True
+
+        if did_fuse:
             self.info(verbose=verbose)
 
         return self

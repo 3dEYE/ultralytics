@@ -657,6 +657,11 @@ class Exporter:
         model.eval()
         model.float()
         model = model.fuse()
+        # DINOv3ConvNeXt has an extra export-only fusion pass that converts
+        # pointwise Linear ops to Conv1x1 for better ONNX/TRT execution.
+        for m in model.modules():
+            if m.__class__.__name__ == "DINOv3ConvNeXt" and hasattr(m, "fuse_for_export"):
+                m.fuse_for_export()
 
         if fmt == "imx":
             from ultralytics.utils.export.imx import FXModel

@@ -87,9 +87,15 @@ class Block(nn.Module):
             # net effect is the same number of Transpose nodes but each
             # ``MatMul+Add`` collapses into a single ``Conv`` ONNX node, and
             # TRT can apply Conv-activation-Conv fusion patterns.
-            x = x.permute(0, 2, 3, 1)              # (N, C, H, W) -> (N, H, W, C)
-            x = self.norm(x)
-            x = x.permute(0, 3, 1, 2)              # (N, H, W, C) -> (N, C, H, W)
+            if getattr(self.norm, "_nchw_mode", False):
+                # LN normalizes the channel dim directly in NCHW (see
+                # ``LayerNorm.forward``): no Transpose nodes at all, the whole
+                # block stays NCHW end-to-end.
+                x = self.norm(x)
+            else:
+                x = x.permute(0, 2, 3, 1)          # (N, C, H, W) -> (N, H, W, C)
+                x = self.norm(x)
+                x = x.permute(0, 3, 1, 2)          # (N, H, W, C) -> (N, C, H, W)
             x = self.pwconv1(x)
             x = self.act(x)
             x = self.pwconv2(x)
@@ -149,6 +155,21 @@ class LayerNorm(nn.Module):
         active = getattr(self, "_affine_active", True)
         weight = self.weight if active else None
         bias = self.bias if active else None
+        if getattr(self, "_nchw_mode", False):
+            # Export-only mode (see ``DINOv3ConvNeXt.norms_to_nchw``): the input
+            # is NCHW and we normalize the channel dim with explicit reduction
+            # ops instead of Transpose + LayerNormalization + Transpose. The
+            # decomposed ReduceMean/Sub/Pow/Sqrt/Div chain is the canonical
+            # pre-opset17 LayerNorm pattern that TensorRT pattern-matches into a
+            # single INormalizationLayer kernel over axis C, so the exported
+            # graph carries zero reformat (Transpose) traffic for this LN.
+            u = x.mean(1, keepdim=True)
+            xc = x - u
+            s = xc.pow(2).mean(1, keepdim=True)
+            x = xc / torch.sqrt(s + self.eps)
+            if weight is not None:
+                x = x * weight.view(1, -1, 1, 1) + bias.view(1, -1, 1, 1)
+            return x
         if self.data_format == "channels_last":
             return F.layer_norm(x, self.normalized_shape, weight, bias, self.eps)
         # channels_first: route through F.layer_norm on the last dim so the ONNX

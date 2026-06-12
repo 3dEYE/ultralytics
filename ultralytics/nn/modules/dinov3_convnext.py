@@ -413,14 +413,45 @@ class DINOv3ConvNeXt(nn.Module):
         return self
 
     @torch.no_grad()
+    def norms_to_nchw(self) -> "DINOv3ConvNeXt":
+        """Switch every backbone ``LayerNorm`` to direct NCHW normalization.
+
+        After :meth:`linear_to_conv1x1` the only non-NCHW computation left is
+        the per-LN ``Transpose -> LayerNormalization -> Transpose`` sandwich
+        (2 Transpose nodes per LN, 44 total for ConvNeXt-Tiny). This transform
+        flags each ``LayerNorm`` (block norms, downsample norms, stem norm) to
+        normalize the channel dim of the NCHW tensor directly with explicit
+        ``ReduceMean/Sub/Pow/Sqrt/Div`` ops -- the canonical decomposed
+        LayerNorm pattern that TensorRT fuses into a single
+        ``INormalizationLayer`` kernel over axis C. The exported graph then
+        carries zero Transpose/reformat traffic in the backbone.
+
+        Export-only and idempotent. Requires :meth:`linear_to_conv1x1` first so
+        block norms receive NCHW input (``Block.forward`` skips its permutes
+        only on the conv1x1 path).
+        """
+        self._ensure_fuse_compat_state()
+        for m in self.modules():
+            if isinstance(m, Block):
+                if not getattr(m, "_use_conv1x1", False):
+                    raise RuntimeError("norms_to_nchw() requires linear_to_conv1x1() to be called first")
+                m.norm._nchw_mode = True
+            elif isinstance(m, LayerNorm) and m.data_format == "channels_first":
+                # Stem + downsample norms already receive NCHW input.
+                m._nchw_mode = True
+        return self
+
+    @torch.no_grad()
     def fuse_for_export(self) -> "DINOv3ConvNeXt":
         """One-shot export preparation: do all the graph-simplification magic.
 
-        Equivalent to ``self.fuse().linear_to_conv1x1()`` behind a single explicit
-        call. Folds ImageNet norm into the stem, LayerNorm affine into the
-        following conv/linear, and layer-scale ``gamma`` into ``pwconv2``; then
-        swaps the pointwise ``Linear`` layers for ``Conv2d(1, 1)`` so TensorRT
-        emits a single ``Conv`` per pointwise op and fuses Conv-GELU-Conv.
+        Equivalent to ``self.fuse().linear_to_conv1x1().norms_to_nchw()`` behind
+        a single explicit call. Folds ImageNet norm into the stem, LayerNorm
+        affine into the following conv/linear, and layer-scale ``gamma`` into
+        ``pwconv2``; swaps the pointwise ``Linear`` layers for ``Conv2d(1, 1)``
+        so TensorRT emits a single ``Conv`` per pointwise op and fuses
+        Conv-GELU-Conv; finally switches every ``LayerNorm`` to direct NCHW
+        normalization so the backbone graph contains no Transpose nodes at all.
 
         Unlike :meth:`fuse` (which is storage-safe), this MUTATES parameter shapes
         (``pwconv1``/``pwconv2`` become 4D ``Conv2d`` weights), so the result is
@@ -430,6 +461,7 @@ class DINOv3ConvNeXt(nn.Module):
         """
         self.fuse()
         self.linear_to_conv1x1()
+        self.norms_to_nchw()
         return self
 
     @staticmethod

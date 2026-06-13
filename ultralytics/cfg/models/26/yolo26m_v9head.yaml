@@ -1,0 +1,44 @@
+# Hybrid: yolo26m backbone + yolov9m head (verbatim)
+# Backbone: yolo26m (scale m, C3k2) with SPPELAN replacing SPPF+C2PSA at P5
+# Head: yolov9m exact copy — works because both backbones have 10 layers (0-9),
+#        so all head layer references (4, 6, 9, 12) map identically.
+#        RepNCSPELAN4 absorbs the larger concat inputs (512ch backbone vs 240/360ch
+#        in v9m) via its cv1 projection, so channel args are kept unchanged.
+
+# Parameters
+nc: 80   # number of classes
+scale: m # required: prevents TypeError in parse_model for C3k2 (None in "mlx" check)
+
+# yolo26m backbone (scale m: width=1.00, max_channels=512)
+# P3 @ layer 4: 512ch  |  P4 @ layer 6: 512ch  |  P5 @ layer 9: 480ch (SPPELAN)
+backbone:
+  - [-1, 1, Conv, [64, 3, 2]]             # 0-P1/2
+  - [-1, 1, Conv, [128, 3, 2]]            # 1-P2/4
+  - [-1, 2, C3k2, [256, True, 0.25]]      # 2
+  - [-1, 1, Conv, [256, 3, 2]]            # 3-P3/8
+  - [-1, 2, C3k2, [512, True, 0.25]]      # 4  (P3, 512ch)
+  - [-1, 1, Conv, [512, 3, 2]]            # 5-P4/16
+  - [-1, 2, C3k2, [512, True]]            # 6  (P4, 512ch)
+  - [-1, 1, Conv, [512, 3, 2]]            # 7-P5/32
+  - [-1, 2, C3k2, [512, True]]            # 8
+  - [-1, 1, SPPELAN, [480, 240]]          # 9  (P5, 480ch) — replaces SPPF+C2PSA
+
+# yolov9m head — verbatim copy (indices identical: backbone is 10 layers in both models)
+head:
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 10
+  - [[-1, 6], 1, Concat, [1]]                    # 11 cat backbone P4 (480+512=992ch)
+  - [-1, 1, RepNCSPELAN4, [360, 360, 180, 1]]    # 12
+
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]  # 13
+  - [[-1, 4], 1, Concat, [1]]                    # 14 cat backbone P3 (360+512=872ch)
+  - [-1, 1, RepNCSPELAN4, [240, 240, 120, 1]]    # 15 (P3/8-small)
+
+  - [-1, 1, AConv, [180]]                        # 16
+  - [[-1, 12], 1, Concat, [1]]                   # 17 cat head P4 (180+360=540ch)
+  - [-1, 1, RepNCSPELAN4, [360, 360, 180, 1]]    # 18 (P4/16-medium)
+
+  - [-1, 1, AConv, [240]]                        # 19
+  - [[-1, 9], 1, Concat, [1]]                    # 20 cat head P5 (240+480=720ch)
+  - [-1, 1, RepNCSPELAN4, [480, 480, 240, 1]]    # 21 (P5/32-large)
+
+  - [[15, 18, 21], 1, Detect, [nc]]              # Detect(P3, P4, P5)

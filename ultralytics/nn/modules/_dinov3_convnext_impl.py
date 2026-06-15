@@ -159,14 +159,14 @@ class LayerNorm(nn.Module):
             # Export-only mode (see ``DINOv3ConvNeXt.norms_to_nchw``): the input
             # is NCHW and we normalize the channel dim with explicit reduction
             # ops instead of Transpose + LayerNormalization + Transpose. The
-            # decomposed ReduceMean/Sub/Pow/Sqrt/Div chain is the canonical
+            # decomposed ReduceMean/Sub/Mul/Add/Rsqrt/Mul chain is the canonical
             # pre-opset17 LayerNorm pattern that TensorRT pattern-matches into a
             # single INormalizationLayer kernel over axis C, so the exported
             # graph carries zero reformat (Transpose) traffic for this LN.
             u = x.mean(1, keepdim=True)
             xc = x - u
-            s = xc.pow(2).mean(1, keepdim=True)
-            x = xc / torch.sqrt(s + self.eps)
+            s = (xc * xc).mean(1, keepdim=True)
+            x = xc * torch.rsqrt(s + self.eps)
             if weight is not None:
                 x = x * weight.view(1, -1, 1, 1) + bias.view(1, -1, 1, 1)
             return x

@@ -121,6 +121,122 @@ def test_dinov3_convnext_fuse_no_degradation():
         )
 
 
+def test_dinov3_convnext_fuse_for_export_no_degradation_and_idempotent():
+    """Verify export-only fuse path stays numerically close and is idempotent."""
+    from ultralytics.nn.modules import DINOv3ConvNeXt
+
+    torch.manual_seed(0)
+    model = DINOv3ConvNeXt(variant="tiny", pretrained=False, freeze=True).eval()
+    x = torch.rand(1, 3, 160, 160)
+
+    with torch.no_grad():
+        y_before = model(x)
+        model.fuse_for_export()
+        y_after_first = model(x)
+        model.fuse_for_export()
+        y_after_second = model(x)
+
+    assert len(y_before) == len(y_after_first), "Feature pyramid length changed after fuse_for_export()"
+    assert len(y_after_first) == len(y_after_second), "Feature pyramid length changed on second fuse_for_export()"
+
+    for i, (a, b) in enumerate(zip(y_before, y_after_first)):
+        torch.testing.assert_close(
+            a,
+            b,
+            rtol=5e-4,
+            atol=3e-4,
+            msg=f"Feature map P{i + 3} diverged after fuse_for_export()",
+        )
+
+    for i, (a, b) in enumerate(zip(y_after_first, y_after_second)):
+        torch.testing.assert_close(
+            a,
+            b,
+            rtol=0,
+            atol=0,
+            msg=f"Feature map P{i + 3} changed after repeated fuse_for_export()",
+        )
+
+
+def test_dinov3_convnext_fuse_for_export_onnx_parity(tmp_path):
+    """Verify ONNX Runtime outputs stay close to PyTorch after fuse_for_export()."""
+    pytest.importorskip("onnx")
+    ort = pytest.importorskip("onnxruntime")
+    from ultralytics.nn.modules import DINOv3ConvNeXt
+    from ultralytics.utils.export.engine import torch2onnx
+
+    torch.manual_seed(0)
+    model = DINOv3ConvNeXt(variant="tiny", pretrained=False, freeze=True).eval()
+    model.fuse_for_export()
+
+    x = torch.rand(1, 3, 160, 160)
+    onnx_path = tmp_path / "dinov3_convnext_tiny_fused.onnx"
+
+    with torch.no_grad():
+        y_pt = model(x)
+        torch2onnx(
+            model,
+            x,
+            onnx_path,
+            opset=17,
+            input_names=["images"],
+            output_names=["p3", "p4", "p5"],
+        )
+
+    session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+    y_ort = session.run(["p3", "p4", "p5"], {"images": x.cpu().numpy()})
+
+    for i, (a, b) in enumerate(zip(y_pt, y_ort)):
+        torch.testing.assert_close(
+            a,
+            torch.from_numpy(b),
+            rtol=1e-3,
+            atol=5e-4,
+            msg=f"ONNX parity mismatch for feature map P{i + 3}",
+        )
+
+
+def test_dinov3_convnext_fuse_for_export_onnx_graph_invariants(tmp_path):
+    """Guard the graph-level wins of fuse_for_export() on the backbone ONNX.
+
+    After fuse_for_export the backbone graph must contain no pointwise GEMM
+    traffic (``Gemm``/``MatMul``), no ``LayerNormalization`` nodes (LN is
+    decomposed to NCHW reductions), and no layout ``Transpose`` reformats.
+    """
+    onnx = pytest.importorskip("onnx")
+    from ultralytics.nn.modules import DINOv3ConvNeXt
+    from ultralytics.utils.export.engine import torch2onnx
+
+    torch.manual_seed(0)
+    model = DINOv3ConvNeXt(variant="tiny", pretrained=False, freeze=True).eval()
+    model.fuse_for_export()
+
+    x = torch.rand(1, 3, 160, 160)
+    onnx_path = tmp_path / "dinov3_convnext_tiny_fused.onnx"
+    with torch.no_grad():
+        torch2onnx(
+            model,
+            x,
+            onnx_path,
+            opset=17,
+            input_names=["images"],
+            output_names=["p3", "p4", "p5"],
+        )
+
+    graph = onnx.load(str(onnx_path)).graph
+    op_counts: dict[str, int] = {}
+    for node in graph.node:
+        op_counts[node.op_type] = op_counts.get(node.op_type, 0) + 1
+
+    assert op_counts.get("Gemm", 0) == 0, f"unexpected Gemm nodes: {op_counts.get('Gemm')}"
+    assert op_counts.get("MatMul", 0) == 0, f"unexpected MatMul nodes: {op_counts.get('MatMul')}"
+    assert op_counts.get("LayerNormalization", 0) == 0, (
+        f"unexpected LayerNormalization nodes: {op_counts.get('LayerNormalization')}"
+    )
+    assert op_counts.get("Transpose", 0) == 0, f"unexpected Transpose nodes: {op_counts.get('Transpose')}"
+    assert op_counts.get("Conv", 0) > 0, "expected pointwise ops folded into Conv nodes"
+
+
 def test_model_profile():
     """Test profiling of the YOLO model with `profile=True` to assess performance and resource usage."""
     from ultralytics.nn.tasks import DetectionModel

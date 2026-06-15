@@ -421,7 +421,7 @@ class DINOv3ConvNeXt(nn.Module):
         (2 Transpose nodes per LN, 44 total for ConvNeXt-Tiny). This transform
         flags each ``LayerNorm`` (block norms, downsample norms, stem norm) to
         normalize the channel dim of the NCHW tensor directly with explicit
-        ``ReduceMean/Sub/Pow/Sqrt/Div`` ops -- the canonical decomposed
+        ``ReduceMean/Sub/Mul/Add/Rsqrt/Mul`` ops -- the canonical decomposed
         LayerNorm pattern that TensorRT fuses into a single
         ``INormalizationLayer`` kernel over axis C. The exported graph then
         carries zero Transpose/reformat traffic in the backbone.

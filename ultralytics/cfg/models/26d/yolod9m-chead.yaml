@@ -1,0 +1,72 @@
+# Ultralytics 🚀 AGPL-3.0 License - https://ultralytics.com/license
+
+# YOLOv9c head with frozen DINOv3 ConvNeXt Tiny backbone (adapter-balanced backbone, v9c-style neck).
+# Input: 640x640
+# Outputs: P3/8, P4/16, P5/32
+# Backbone frozen; adapters + neck + head are trainable.
+#
+# Differences vs yolod9m-balanced.yaml:
+#   - Bottom-up path uses ADown (as in yolov9c) instead of AConv.
+#   - P4->P5 bottom-up concat targets the SPPELAN output (layer 7) directly,
+#     matching the yolov9c topology.
+#
+# DINOv3 ConvNeXt Tiny channels:
+#   P3: 192
+#   P4: 384
+#   P5: 768
+
+nc: 80
+end2end: False
+
+backbone:
+  # [from, repeats, module, args]
+
+  # 0: returns tuple/list: [P3/8, P4/16, P5/32]
+  - [-1, 1, DINOv3ConvNeXt, ["dinov3_convnext_tiny_pretrain_lvd1689m-21b726bb.pth", True, True, [1, 2, 3]]]
+
+  # Raw DINOv3 feature maps
+  - [-1, 1, Index, [192, 0]]       # 1: raw P3/8   192 ch, 80x80 @ 640
+  - [-2, 1, Index, [384, 1]]       # 2: raw P4/16  384 ch, 40x40 @ 640
+  - [-3, 1, Index, [768, 2]]       # 3: raw P5/32  768 ch, 20x20 @ 640
+
+  # Trainable 1x1 Conv-BN-SiLU adapters for frozen DINOv3 features.
+  # P4/P5 are compressed before the neck to reduce concat cost.
+  - [1, 1, Conv, [192, 1, 1]]      # 4: adapted P3/8   192 ch
+  - [2, 1, Conv, [256, 1, 1]]      # 5: adapted P4/16  256 ch
+  - [3, 1, Conv, [256, 1, 1]]      # 6: adapted P5/32  256 ch
+
+  # P5 context block
+  - [-1, 1, SPPELAN, [256, 128]]   # 7: P5/32 256 ch
+
+
+head:
+  # -------------------------
+  # Top-down path: P5 -> P4
+  # -------------------------
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]       # 8: 20x20 -> 40x40  256 ch
+  - [[-1, 5], 1, Concat, [1]]                        # 9: cat adapted P4  (256+256=512 ch)
+  - [-1, 1, RepNCSPELAN4, [256, 256, 128, 1]]        # 10: td P4  256 ch
+
+  # -------------------------
+  # Top-down path: P4 -> P3
+  # -------------------------
+  - [-1, 1, nn.Upsample, [None, 2, "nearest"]]       # 11: 40x40 -> 80x80  256 ch
+  - [[-1, 4], 1, Concat, [1]]                        # 12: cat adapted P3  (256+192=448 ch)
+  - [-1, 1, RepNCSPELAN4, [192, 192, 96, 1]]         # 13: P3/8 small  192 ch
+
+  # -------------------------
+  # Bottom-up path: P3 -> P4  (ADown as in yolov9c)
+  # -------------------------
+  - [-1, 1, ADown, [192]]                             # 14: 80x80 -> 40x40  192 ch
+  - [[-1, 10], 1, Concat, [1]]                       # 15: cat td P4  (192+256=448 ch)
+  - [-1, 1, RepNCSPELAN4, [256, 256, 128, 1]]        # 16: P4/16 medium  256 ch
+
+  # -------------------------
+  # Bottom-up path: P4 -> P5  (ADown + cat SPPELAN as in yolov9c)
+  # -------------------------
+  - [-1, 1, ADown, [256]]                             # 17: 40x40 -> 20x20  256 ch
+  - [[-1, 7], 1, Concat, [1]]                        # 18: cat SPPELAN P5  (256+256=512 ch)
+  - [-1, 1, RepNCSPELAN4, [256, 256, 128, 1]]        # 19: P5/32 large  256 ch
+
+  # Detect
+  - [[13, 16, 19], 1, Detect, [nc]]                  # 20: Detect(P3, P4, P5)

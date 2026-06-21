@@ -317,7 +317,7 @@ def get_cfg(
     Examples:
         >>> from ultralytics.cfg import get_cfg
         >>> config = get_cfg()  # Load default configuration
-        >>> config_with_overrides = get_cfg("path/to/config.yaml", overrides={"epochs": 50, "batch_size": 16})
+        >>> config_with_overrides = get_cfg("path/to/config.yaml", overrides={"epochs": 50, "batch": 16})
 
     Notes:
         - If both `cfg` and `overrides` are provided, the values in `overrides` will take precedence.
@@ -368,7 +368,7 @@ def check_cfg(cfg: dict, hard: bool = True) -> None:
         ... }
         >>> check_cfg(config, hard=False)
         >>> print(config)
-        {'epochs': 50, 'lr0': 0.01, 'momentum': 0.937, 'save': True}  # corrected 'save' key
+        {'epochs': 50, 'lr0': 0.01, 'momentum': 0.937, 'save': True}
 
     Notes:
         - The function modifies the input dictionary in-place.
@@ -477,8 +477,7 @@ def _handle_deprecation(custom: dict) -> dict:
     Examples:
         >>> custom_config = {"boxes": True, "hide_labels": "False", "line_thickness": 2}
         >>> _handle_deprecation(custom_config)
-        >>> print(custom_config)
-        {'show_boxes': True, 'show_labels': True, 'line_width': 2}
+        {'show_boxes': True, 'show_labels': False, 'line_width': 2}
 
     Notes:
         This function modifies the input dictionary in-place, replacing deprecated keys with their current
@@ -521,14 +520,14 @@ def check_dict_alignment(
         allowed_custom_keys (set | None): Optional set of additional keys that are allowed in the custom dictionary.
 
     Raises:
-        SystemExit: If mismatched keys are found between the custom and base dictionaries.
+        SyntaxError: If mismatched keys are found between the custom and base dictionaries.
 
     Examples:
-        >>> base_cfg = {"epochs": 50, "lr0": 0.01, "batch_size": 16}
-        >>> custom_cfg = {"epoch": 100, "lr": 0.02, "batch_size": 32}
+        >>> base_cfg = {"epochs": 50, "lr0": 0.01, "batch": 16}
+        >>> custom_cfg = {"epoch": 100, "lr": 0.02, "batch": 32}
         >>> try:
         ...     check_dict_alignment(base_cfg, custom_cfg)
-        ... except SystemExit:
+        ... except SyntaxError:
         ...     print("Mismatched keys found")
 
     Notes:
@@ -652,7 +651,7 @@ def handle_yolo_settings(args: list[str]) -> None:
 
     Examples:
         >>> handle_yolo_settings(["reset"])  # Reset YOLO settings
-        >>> handle_yolo_settings(["default_cfg_path=yolo26n.yaml"])  # Update a specific setting
+        >>> handle_yolo_settings(["runs_dir=path/to/dir"])  # Update a specific setting
 
     Notes:
         - If no arguments are provided, the function will display the current settings.

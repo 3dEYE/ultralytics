@@ -242,7 +242,7 @@ class Detect(nn.Module):
         Returns:
             (torch.Tensor, torch.Tensor, torch.Tensor): Top scores, class indices, and filtered indices.
         """
-        batch_size, anchors, nc = scores.shape  # i.e. shape(16,8400,84)
+        batch_size, anchors, nc = scores.shape  # i.e. shape(16,8400,80)
         # Use max_det directly during export for TensorRT compatibility (requires k to be constant),
         # otherwise use min(max_det, anchors) for safety with small inputs during Python inference
         k = max_det if self.export else min(max_det, anchors)
@@ -1855,8 +1855,7 @@ class SemanticSegment(nn.Module):
 
         Returns:
             (torch.Tensor | tuple): Logits of shape [B, nc, H/8, W/8] during training (or a (main, aux) tuple when
-                aux_head is present), inference, and CoreML export. Other export formats return upsampled logits of
-                shape [B, nc, H, W].
+                aux_head is present) and inference. Export returns upsampled logits of shape [B, nc, H, W].
         """
         # Classify
         logits = self.classifier(x[0])  # [B, nc, H/8, W/8]
@@ -1864,6 +1863,6 @@ class SemanticSegment(nn.Module):
             if self.aux_head is not None:
                 return logits, self.aux_head(x[1])  # main + aux (P4)
             return logits
-        if self.export and self.format != "coreml":  # coreml does not support interpolate
+        if self.export:
             return F.interpolate(logits, scale_factor=8, mode="bilinear", align_corners=False)
         return logits

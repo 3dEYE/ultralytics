@@ -157,7 +157,7 @@ Training time depends on:
 - Number of epochs
 - GPU type selected
 
-A typical training run with 1000 images, YOLO26n, 100 epochs on RTX PRO 6000 takes about 2-3 hours. Smaller runs (500 images, 50 epochs on RTX 4090) complete in under an hour. See [cost examples](cloud-training.md#cost-examples) for detailed estimates.
+A typical training run with 1000 images, YOLO26n, 100 epochs on RTX PRO 6000 takes about 5-10 minutes. Smaller runs (500 images, 50 epochs on RTX 4090) complete in under an hour. See [cost examples](cloud-training.md#cost-examples) for detailed estimates.
 
 ### Can I train multiple models simultaneously?
 
@@ -167,8 +167,8 @@ Yes. Concurrent cloud training limits depend on your plan: Free allows 3, Pro al
 
 If training fails:
 
-1. Checkpoints are saved at each epoch
-2. You can resume from the last checkpoint
+1. The model is marked failed and the compute instance is terminated
+2. You can start a new training run from the base model
 3. Credits are only charged for completed compute time
 
 ### How do I choose the right GPU?
